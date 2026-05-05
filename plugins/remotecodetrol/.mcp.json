@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "bridge": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "${CLAUDE_PLUGIN_ROOT}/mcp-server",
+        "remotecodetrol-mcp"
+      ],
+      "env": {}
+    }
+  }
+}

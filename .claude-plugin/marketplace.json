@@ -1,0 +1,14 @@
+{
+  "name": "remotecodetrol",
+  "owner": {
+    "name": "Zachary Priddy",
+    "email": "anthropic@zpriddy.com"
+  },
+  "plugins": [
+    {
+      "name": "remotecodetrol",
+      "source": "./plugins/remotecodetrol",
+      "description": "Bundled MCP server + skill for sending iOS push notifications and polling for replies via the RemoteCodetrol app."
+    }
+  ]
+}

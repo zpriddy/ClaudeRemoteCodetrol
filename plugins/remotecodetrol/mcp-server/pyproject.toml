@@ -1,0 +1,47 @@
+[project]
+name = "remotecodetrol-mcp"
+version = "0.2.2"
+description = "MCP server for the RemoteCodetrol iOS notification/remote-control system."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [
+    { name = "Zachary Priddy", email = "anthropic@zpriddy.com" },
+]
+keywords = ["mcp", "claude-code", "remotecodetrol", "ios", "oauth"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: MacOS",
+]
+dependencies = [
+    "fastmcp>=0.2.0",
+    "httpx>=0.27.0",
+    "keyring>=24.0.0",
+    "pyjwt>=2.8.0",
+    "pydantic>=2.7.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "respx>=0.21.0",
+]
+
+[project.scripts]
+remotecodetrol-mcp = "remotecodetrol_mcp.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/remotecodetrol_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
