@@ -8,27 +8,36 @@ description: Use when sending status notifications to the user via the RemoteCod
 When you need to notify the user or request input, use the `remotecodetrol`
 MCP. The user receives a push on their iPhone and replies from the app.
 
-## Drain pending replies before sending — ALWAYS
+## Read & process pending replies before sending — ALWAYS
 
-**Before every `send_message` call, drain the user-reply queue first.** The
-queue is crash-safe — replies sit unacked across Claude sessions until
-explicitly acked. If you `send_message` without draining first, your next
-`wait_for_response` will return a stale reply from a previous session
-(weird from the user's perspective: they reply, but you "echo" something
-they sent hours ago).
+**Before every `send_message` call, peek the queue and *process* any
+unacked replies. Never silently ack-and-discard.** Replies are crash-safe
+and persist across Claude sessions, so users can send messages between
+Claude's turns or even across separate sessions, and you might be the
+first Claude that sees them.
 
-Concrete pattern:
+The flow:
 
-```
-peek_messages()
-  → if non-empty: process the replies, then ack_messages(message_ids=[...])
-send_message(...)
-  → if you need a reply, follow up with wait_for_response(...)
-```
+1. **`peek_messages()`** — see what's pending.
+2. **For each reply, decide:**
+   - **Relevant to the current task** → fold it into your reasoning + your
+     reply. Reference it explicitly in your next `send_message` body so
+     the user knows you read it ("Got your '<quoted snippet>' — yes, doing
+     X now").
+   - **Stale or out-of-scope** → still acknowledge it explicitly in your
+     next `send_message` body. Don't pretend you didn't see it. Example:
+     *"Saw your earlier reply '<snippet>' — that looks like context from
+     a different task; flag if you want me to act on it."*
+   - **Conversational / no action needed** → a short ack is enough
+     ("Got '👍'") so the user knows the system delivered it.
+3. **`ack_messages(message_ids=[...])`** — ack EVERYTHING you peeked,
+   even the stale ones. The user has been informed; they don't need
+   to see the same reply re-surface in a future turn.
+4. **Then** call your new `send_message`.
 
-If a peek returns multiple messages, process all of them — usually the
-most recent one is the relevant one, but treat the older ones as context
-the user sent thinking you'd already see them.
+The cardinal rule: **the user should always be able to look at the thread
+and see that Claude saw every message they sent.** If a reply went in,
+the next Claude message acknowledges it (briefly is fine).
 
 ## When to send
 
@@ -46,10 +55,11 @@ After `send_message(..., require_response=True)`, enter polling mode:
 
 - **Easy path:** call `wait_for_response(timeout_minutes=...)`. It loops
   `peek_messages` -> `ack_messages` for you and returns the user's reply, or
-  an empty list on timeout.
-- **Manual path:** `peek_messages()` returns unacked replies (crash-safe — they
-  remain returnable until you ack). After processing, call
-  `ack_messages(message_ids=[...])` so they don't show up again.
+  an empty list on timeout. Note: this auto-acks, so the responsibility to
+  *acknowledge in your next send_message body* still applies — wrap the
+  reply content into your reasoning visibly.
+- **Manual path:** `peek_messages()` returns unacked replies. Process each
+  per the rules above, then call `ack_messages(message_ids=[...])`.
 
 Default poll interval is 300s and default timeout is 10 minutes; both are
 overridable per-call and via `REMOTECODETROL_DEFAULT_POLL_INTERVAL_SECONDS` /
@@ -58,12 +68,13 @@ overridable per-call and via `REMOTECODETROL_DEFAULT_POLL_INTERVAL_SECONDS` /
 If the timeout fires with no reply, summarize current state in your final
 message to the user and stop — don't spin forever.
 
-## End of every interaction — ack everything pending
+## End of every interaction — final peek + ack
 
-After you've sent your final reply for the turn, do one last
-`peek_messages()`. If there's anything unacked, ack it. This keeps the
-queue clean so the next session doesn't open with a stale "echo of an old
-reply" surprise.
+Before you stop the turn, do one last `peek_messages()`. If new replies
+arrived while you were composing or working, process them per the rules
+above (your final `send_message` is the place to acknowledge them). This
+keeps the queue clean so the next session doesn't open with surprise
+leftovers.
 
 ## Picking the thread
 
