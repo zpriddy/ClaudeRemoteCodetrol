@@ -207,9 +207,28 @@ def main() -> int:
     if not new_messages:
         return 0
 
-    # Step 4: Emit additionalContext.
+    # Step 4: Emit additionalContext in Claude Code's expected envelope.
+    #
+    # Schema (verified against this session's transcript JSONL —
+    # SessionStart hooks emit the same shape):
+    #     {
+    #       "hookSpecificOutput": {
+    #         "hookEventName": "UserPromptSubmit",
+    #         "additionalContext": "..."
+    #       }
+    #     }
+    #
+    # Earlier versions of this plugin (v0.3.0–0.3.7) emitted just
+    # `{"additionalContext": "..."}` — Claude Code accepted the script's
+    # exit code but didn't surface the unwrapped field as injectable
+    # context. The fix is purely the output shape.
     context = _build_additional_context(new_messages, now)
-    output = {"additionalContext": context}
+    output = {
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": context,
+        }
+    }
     sys.stdout.write(json.dumps(output))
     sys.stdout.flush()
 

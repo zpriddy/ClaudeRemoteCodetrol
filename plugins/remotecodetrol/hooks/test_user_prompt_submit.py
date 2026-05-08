@@ -146,8 +146,8 @@ def test_new_messages_emits_context(env: dict) -> None:
     assert res.returncode == 0, res.stderr
     assert res.stdout, "expected JSON output"
     payload = json.loads(res.stdout)
-    assert "additionalContext" in payload
-    ctx = payload["additionalContext"]
+    assert "hookSpecificOutput" in payload and "additionalContext" in payload["hookSpecificOutput"]
+    ctx = payload["hookSpecificOutput"]["additionalContext"]
     assert "Sweet, it's working!" in ctx
     assert "second one" in ctx
     assert "[thread:test]" in ctx
@@ -179,8 +179,8 @@ def test_partially_seen_emits_only_new(env: dict) -> None:
     )
     assert res.returncode == 0
     payload = json.loads(res.stdout)
-    assert "FRESH" in payload["additionalContext"]
-    assert "old" not in payload["additionalContext"]
+    assert "FRESH" in payload["hookSpecificOutput"]["additionalContext"]
+    assert "old" not in payload["hookSpecificOutput"]["additionalContext"]
 
 
 def test_malformed_pending_no_op(env: dict) -> None:
@@ -215,7 +215,7 @@ def test_malformed_cursor_treated_as_empty(env: dict) -> None:
     )
     assert res.returncode == 0
     payload = json.loads(res.stdout)
-    assert "BM1" not in payload["additionalContext"] or "hello" in payload["additionalContext"]
+    assert "BM1" not in payload["hookSpecificOutput"]["additionalContext"] or "hello" in payload["hookSpecificOutput"]["additionalContext"]
     # Cursor was overwritten cleanly.
     cursor_doc = json.loads(cursor.read_text())
     assert cursor_doc == {"last_shown_ids": ["BM1"]}
@@ -278,4 +278,4 @@ def test_default_cache_path_when_no_project_dir(tmp_path: Path) -> None:
     )
     assert res.returncode == 0, res.stderr
     payload = json.loads(res.stdout)
-    assert "from-default-path" in payload["additionalContext"]
+    assert "from-default-path" in payload["hookSpecificOutput"]["additionalContext"]
