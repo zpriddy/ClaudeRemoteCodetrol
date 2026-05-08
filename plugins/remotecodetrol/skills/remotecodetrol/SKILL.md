@@ -132,38 +132,57 @@ naturally. Claude doesn't need to do anything special.
 **But if Claude is ending its turn and nothing else will prompt the
 session for a long time** — no user typing, no automation — the reply
 sits in the cache + state file forever. To fix this without blocking
-(which would freeze the session), Claude should set up a self-poll
-loop using Claude Code's `/loop` skill:
+(which would freeze the session), Claude can self-poll using Claude
+Code's **built-in `loop` skill** (NOT `ralph-loop:ralph-loop`, which
+is a different mechanism — Ralph fires the same prompt back-to-back
+on every exit, no time interval, designed for "agent grinds until
+done" patterns).
+
+Invoke via the Skill tool:
 
 ```
-/loop 5m peek_messages
+Skill: loop
+Args: 5m peek messages from remotecodetrol on the active thread and
+      process any pending. End turn quickly if nothing pending.
 ```
 
-This re-invokes `peek_messages` every 5 minutes in the same session.
-Each invocation:
-1. Triggers the UserPromptSubmit hook (pending replies inject as
-   `additionalContext`).
-2. Returns the cache state to Claude (a no-op cost when nothing's
-   pending — local lookup, zero network).
+The `loop` skill parses the leading `5m` as the interval, schedules a
+recurring CronCreate job under the hood, and runs the prompt once
+immediately. Every iteration:
+1. Triggers UserPromptSubmit → fires our hook → injects pending
+   replies as `additionalContext`.
+2. Claude runs the prompt body (peek_messages or similar) for
+   belt-and-suspenders cache check.
+3. If replies are pending, Claude acks them and **cancels the loop**
+   via `CronDelete` (job ID is in the loop's confirmation message).
 
-When the reply arrives, the next loop iteration delivers it. Claude
-processes it, acks, and **cancels the loop** (`/cancel-ralph` or the
-equivalent) so it doesn't keep polling forever.
+**Important constraints (from CronCreate):**
+- **Minimum effective interval is `1m`.** Cron's granularity is
+  one minute, so `30s` silently rounds up to `*/1 * * * *`. If you
+  want sub-minute polling, you need `wait=True` instead.
+- **Session-scoped by default** — the cron dies when Claude Code
+  exits. For waits that should survive across sessions, use the
+  `schedule` skill (cloud-based, durable) or pass `durable=true`
+  to CronCreate directly.
+- **Auto-expires after 7 days** — bounds runaway loops.
 
 **When to set up a self-poll:**
-- Sending with `require_response=True, wait=False` (default).
+- `send_message(require_response=True, wait=False)` (default).
 - Claude is ending the turn after sending.
-- The reply might take longer than the user's typical response cadence
-  (e.g., overnight wait, user is in a meeting).
+- Reply may take longer than the user's typical response cadence
+  (overnight wait, user is in a meeting, etc.).
 - No external automation is expected to prompt the session.
 
 **Loop interval choice:**
-- `5m` — good default for "user might reply in minutes-to-hours"
-- `30s` — for time-critical decisions where you'd otherwise have used `wait=True`
-- self-paced (omit interval) — Claude decides when to re-check
+- `5m` — good default for "user might reply in minutes-to-hours".
+- `1m` — minimum useful; for time-critical decisions where you'd
+  otherwise have used `wait=True`.
+- self-paced (no interval) — Claude decides when to re-check;
+  uses ScheduleWakeup instead of CronCreate. Best when the cadence
+  needs to vary based on context.
 
 **Don't set up a loop when:**
-- An external prompt source is already feeding the session.
+- External prompt automation is already feeding the session.
 - The user is actively at the terminal (their typing IS the cron).
 - `wait=True` would be more appropriate (decision is blocking
   everything else anyway).
@@ -173,11 +192,13 @@ For one-shot deferred checks rather than recurring, use the
 
 ```
 Skill: schedule
-Args: in 1 hour, peek_messages on remotecodetrol
+Args: in 1 hour, peek messages on remotecodetrol
 ```
 
-Either way, the session stays responsive between checks — no blocking,
-no dependency on the user's manual prompts.
+**Always cancel the loop when the reply is processed.** The job ID
+is returned by CronCreate when the `loop` skill creates it; pass it
+to `CronDelete`. Forgetting to cancel = the loop keeps polling for
+up to 7 days. Cheap (cache lookups) but noisy in your transcript.
 
 ## Cross-session discipline — only ack your active thread
 
