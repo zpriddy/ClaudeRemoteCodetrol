@@ -71,6 +71,24 @@ class StreamingState:
     state_change: asyncio.Event = field(default_factory=asyncio.Event)
     active_thread: str | None = None
     last_event_id: str | None = None
+    # Set by SseConsumer at init time. tools.py calls `await persist_now()`
+    # after a proactive cache prune (HTTP ack path) so the state file stays
+    # in sync — without this, the file lags the cache until SSE delivers a
+    # `message.acked` event back, which then no-ops because the cache is
+    # already pruned. Net: hook re-injects already-acked messages.
+    writer: "StateFileWriter | None" = None
+
+    async def persist_now(self) -> None:
+        """Trigger an immediate state-file write via the SSE consumer's
+        writer. Used by tools.ack_messages after proactive pruning."""
+        if self.writer is None:
+            return
+        try:
+            result = self.writer(self)
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception as e:  # defensive — disk problems must not break ack
+            logger.warning("state.persist_now failed: %s", e)
 
     # ---- mutators (call from SseConsumer or ack path) ----
 
@@ -307,6 +325,12 @@ class SseConsumer:
         self.http = http
         self.state = state
         self._state_file_writer = state_file_writer
+        # Wire the writer onto the state so tools (e.g. ack_messages) can
+        # trigger persistence directly after a proactive cache prune.
+        # Without this, the state file lags the cache until SSE delivers
+        # a message.acked round-trip — and then the SSE handler no-ops
+        # because remove_messages returns 0 (already pruned).
+        state.writer = state_file_writer
         self._rng = rng or random
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()

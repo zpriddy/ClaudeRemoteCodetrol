@@ -309,6 +309,13 @@ def register_tools(
         # 2xx and we're safe to prune locally.
         if streaming is not None:
             streaming.prune_acked(tid, message_ids)
+            # Persist the post-prune cache to the state file so the
+            # UserPromptSubmit hook doesn't re-inject already-acked
+            # messages on the next prompt. Without this, the state file
+            # lags the cache until the SSE round-trip delivers a
+            # message.acked event — and then that event no-ops because
+            # remove_messages returns 0 (already pruned).
+            await streaming.persist_now()
         return AckResult(acked=len(message_ids))
 
     @mcp.tool

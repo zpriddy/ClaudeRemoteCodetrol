@@ -593,3 +593,52 @@ async def test_send_message_returns_bundled_pending(
         assert out["pending_messages"][0]["id"] == "in1"
     finally:
         await http.aclose()
+
+
+async def test_ack_messages_persists_state_file_after_proactive_prune(
+    fake_keyring, config, jwt_factory, tmp_path
+):
+    """Regression for v0.3.1 → v0.3.2 hook bug.
+
+    When tools.ack_messages succeeds against the backend, it proactively
+    prunes the local cache (so subsequent peek doesn't see ghosts). It
+    MUST also persist the state file — otherwise the UserPromptSubmit
+    hook re-injects already-acked messages on the next prompt.
+
+    The bug: only the SSE message.acked handler called persist, and that
+    handler no-ops because tools.py beat it to the prune (remove_messages
+    returns 0). Net: state file lagged the cache forever.
+    """
+    write_calls: list[dict] = []
+
+    async def writer(state: StreamingState) -> None:
+        # Capture the snapshot of `pending` at write time.
+        write_calls.append({tid: list(msgs) for tid, msgs in state.pending.items()})
+
+    streaming = StreamingState()
+    streaming.writer = writer
+    # Pre-populate cache as if the SSE consumer had received this message.
+    streaming.pending["t"] = [{"id": "m1", "thread_id": "t", "body": "hi"}]
+
+    def h(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and "/ack" in request.url.path:
+            return httpx.Response(200, json={})
+        return httpx.Response(404)
+
+    mcp, http, _ = await _build_mcp(
+        h, fake_keyring, config, jwt_factory, tmp_path, streaming=streaming
+    )
+    try:
+        await _call(mcp, "set_thread", name="t")
+        ack = await _call(mcp, "ack_messages", message_ids=["m1"])
+        assert ack["acked"] == 1
+        # The cache mutation must have triggered a state-file write.
+        assert len(write_calls) == 1, (
+            "ack_messages must persist after proactive prune"
+        )
+        # The persisted snapshot must reflect the pruned state (no m1).
+        assert "t" not in write_calls[0], (
+            f"acked message should NOT appear in persisted state: {write_calls[0]}"
+        )
+    finally:
+        await http.aclose()
