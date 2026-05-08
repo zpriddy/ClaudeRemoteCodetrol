@@ -55,6 +55,21 @@ def _isolated_token_path(monkeypatch: pytest.MonkeyPatch, tmp_path):
     return test_token_path
 
 
+@pytest.fixture(autouse=True)
+def _isolated_state_path(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    """Redirect state.STATE_PATH to a tmp dir for every test.
+
+    Without this, the auth code's `_read_pending()` reads
+    `~/.config/remotecodetrol/state.json` — which on a real dev box may
+    contain a real pending device flow, causing tests that don't expect
+    a pending flow to make an HTTP poll against the test mock. Bites
+    test_run_waits_for_link_on_no_token specifically.
+    """
+    import remotecodetrol_mcp.state as state_mod
+    state_mod.STATE_PATH = tmp_path / "state.json"
+    return state_mod.STATE_PATH
+
+
 @pytest.fixture
 def fake_keyring(monkeypatch: pytest.MonkeyPatch) -> FakeKeyring:
     fake = FakeKeyring()

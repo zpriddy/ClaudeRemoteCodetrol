@@ -46,6 +46,18 @@ ACTIVE_EMAIL_ACCOUNT = "__active_email__"
 ACCESS_TOKEN_LEEWAY_SECONDS = 60
 PENDING_FLOW_KEY = "pending_device_flow"
 
+# Minimum spacing between device-code polls (v0.3.6). Overrides the
+# 5s `interval` the server returns at flow start. Rationale: the
+# device flow is human-gated (open phone, type code, confirm) — that's
+# tens-of-seconds at minimum, so polling every 5s produces noise without
+# any UX benefit. Tunable via REMOTECODETROL_DEVICE_POLL_MIN_SECONDS
+# env var if you need to override.
+import os as _os  # local alias to avoid touching the import block
+
+MIN_DEVICE_POLL_INTERVAL_SECONDS = int(
+    _os.environ.get("REMOTECODETROL_DEVICE_POLL_MIN_SECONDS", "30")
+)
+
 
 class AuthError(RuntimeError):
     """Raised when authentication cannot be completed (terminal failure)."""
@@ -279,6 +291,14 @@ class AuthClient:
         self.http = http
         self.store = store or TokenStore(config.keychain_service)
         self._cached: TokenBundle | None = None
+        # Device-code poll cooldown. The server returns interval=5s as a
+        # baseline, but we enforce a stricter minimum because the device
+        # flow is gated on a human physically interacting with their
+        # phone (open app → enter code → tap Confirm), which is on
+        # tens-of-seconds timescale, not seconds. Polling every 5s is
+        # pure noise. We also obey RFC 8628 `slow_down` by extending
+        # the cooldown after the server tells us to slow down.
+        self._next_device_poll_allowed_at: float = 0.0
 
     # ---- public API ----
 
@@ -406,16 +426,28 @@ class AuthClient:
         """Poll /oauth/token ONCE for a pending device flow.
 
         Returns:
-            TokenBundle on success (and stores tokens to keychain).
-            None if the user hasn't authorized yet (`authorization_pending`)
-              or the server says `slow_down` (treated like pending here —
-              the caller can simply re-invoke later).
+            TokenBundle on success (and stores tokens to disk).
+            None if the user hasn't authorized yet (`authorization_pending`,
+              `slow_down`, or we're in cooldown from a recent poll).
 
         Raises:
             AuthError if the flow is terminally failed (`expired_token`,
             `access_denied`) or a network/protocol error occurs. The
             pending state is cleared from disk in that case.
             NotAuthorizedError if there's no pending flow at all.
+
+        Cooldown semantics (v0.3.6+): we enforce
+        `MIN_DEVICE_POLL_INTERVAL_SECONDS` (default 30s) between polls
+        regardless of what `interval` the server returned at flow start.
+        Reasons:
+        - The flow is gated on a human picking up their phone, opening
+          the app, typing the code, tapping Confirm. That's
+          tens-of-seconds at best, so 5s polling is pure noise.
+        - Repeated tool calls during link (e.g. Claude calling whoami
+          rapidly to check status) used to fire one poll per call,
+          earning RFC 8628 `slow_down` from the server.
+        - On `slow_down`, we extend the cooldown by 30s additional, per
+          RFC 8628 §3.5 ("the client MUST increase the polling interval").
         """
         pending = self._read_pending()
         if not pending:
@@ -428,6 +460,11 @@ class AuthClient:
                 "again to start a new one."
             )
 
+        # Cooldown gate: skip the HTTP call entirely if we polled too recently.
+        now = time.time()
+        if now < self._next_device_poll_allowed_at:
+            return None
+
         v1 = self.config.api_v1
         resp = await self.http.post(
             f"{v1}/oauth/token",
@@ -436,6 +473,13 @@ class AuthClient:
                 "device_code": pending["device_code"],
             },
         )
+        # Schedule next allowed poll BEFORE handling the response, so even on
+        # success we leave a quiet window (matters less but keeps logic
+        # uniform).
+        self._next_device_poll_allowed_at = (
+            time.time() + MIN_DEVICE_POLL_INTERVAL_SECONDS
+        )
+
         if resp.status_code == 200:
             payload = resp.json()
             access = payload["access_token"]
@@ -457,7 +501,14 @@ class AuthClient:
         except Exception:
             err = {"error": f"http_{resp.status_code}"}
         code = err.get("error", "")
-        if code in ("authorization_pending", "slow_down"):
+        if code == "slow_down":
+            # RFC 8628 §3.5: client MUST increase polling interval by ≥5s.
+            # We add a full extra cooldown window on top of the baseline.
+            self._next_device_poll_allowed_at = (
+                time.time() + MIN_DEVICE_POLL_INTERVAL_SECONDS * 2
+            )
+            return None
+        if code == "authorization_pending":
             return None
         if code in ("expired_token", "access_denied"):
             self._clear_pending()

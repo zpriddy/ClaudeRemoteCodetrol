@@ -443,3 +443,121 @@ def test_token_store_clear_removes_only_target_email(
     store.clear("a@example.com")
     assert store.get_refresh_token("a@example.com") is None
     assert store.get_refresh_token("b@example.com") == "rb"
+
+
+# ---- v0.3.6: device-code poll cooldown ----
+
+
+async def test_device_poll_cooldown_skips_http_when_recent(
+    fake_keyring, config, jwt_factory, monkeypatch
+):
+    """After a poll fires, subsequent polls within the cooldown window
+    skip the HTTP call entirely and return None (still pending).
+
+    Regression for v0.3.6: rapid `whoami` calls (or any path triggering
+    get_access_token while a device flow is pending) used to fire one
+    HTTP poll per call, producing slow_down errors from the OAuth
+    server. The cooldown gate makes repeat calls return None without
+    network I/O.
+    """
+    import httpx
+    import time as time_mod
+
+    poll_calls: list[None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/oauth/token"):
+            poll_calls.append(None)
+            # Pretend the user hasn't authorized yet.
+            return httpx.Response(
+                400, json={"error": "authorization_pending"}
+            )
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(handler)
+    http = httpx.AsyncClient(transport=transport)
+    store = TokenStore(config.keychain_service)
+    auth = AuthClient(config, http, store)
+    # Seed a pending device flow via state.json (the test isolates the
+    # state path via the autouse fixture in conftest).
+    from remotecodetrol_mcp.state import update_state
+    from remotecodetrol_mcp.auth import PENDING_FLOW_KEY
+    update_state({
+        PENDING_FLOW_KEY: {
+            "device_code": "dc_1",
+            "user_code": "AAAA-BBBB",
+            "verification_uri": "https://example.test/authz",
+            "interval": 5,
+            "expires_at": time_mod.time() + 600,
+        }
+    })
+
+    try:
+        # First poll: hits the server.
+        result = await auth.complete_device_flow_once()
+        assert result is None
+        assert len(poll_calls) == 1
+
+        # Immediate second poll: should be gated by cooldown, no HTTP.
+        result = await auth.complete_device_flow_once()
+        assert result is None
+        assert len(poll_calls) == 1, (
+            f"second poll within cooldown should NOT hit server, but did "
+            f"({len(poll_calls)} total HTTP calls)"
+        )
+
+        # Force-expire the cooldown by rewinding the timestamp.
+        auth._next_device_poll_allowed_at = 0.0
+
+        # Now polling should hit again.
+        result = await auth.complete_device_flow_once()
+        assert result is None
+        assert len(poll_calls) == 2
+    finally:
+        await http.aclose()
+
+
+async def test_device_poll_extends_cooldown_on_slow_down(
+    fake_keyring, config, jwt_factory
+):
+    """RFC 8628 §3.5: on `slow_down`, the client MUST increase its
+    polling interval. Our implementation extends the cooldown to
+    2× the baseline."""
+    import httpx
+    import time as time_mod
+    from remotecodetrol_mcp.auth import MIN_DEVICE_POLL_INTERVAL_SECONDS
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/oauth/token"):
+            return httpx.Response(400, json={"error": "slow_down"})
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(handler)
+    http = httpx.AsyncClient(transport=transport)
+    auth = AuthClient(config, http, TokenStore(config.keychain_service))
+    from remotecodetrol_mcp.state import update_state
+    from remotecodetrol_mcp.auth import PENDING_FLOW_KEY
+    update_state({
+        PENDING_FLOW_KEY: {
+            "device_code": "dc_2",
+            "user_code": "CCCC-DDDD",
+            "verification_uri": "https://example.test/authz",
+            "interval": 5,
+            "expires_at": time_mod.time() + 600,
+        }
+    })
+
+    try:
+        before = time_mod.time()
+        result = await auth.complete_device_flow_once()
+        assert result is None
+        # slow_down should set cooldown to 2× baseline (relative to now).
+        # Allow a small tolerance for timing.
+        cooldown = auth._next_device_poll_allowed_at - before
+        expected_min = MIN_DEVICE_POLL_INTERVAL_SECONDS * 2 - 1
+        assert cooldown >= expected_min, (
+            f"slow_down should extend cooldown to ≥{expected_min}s, "
+            f"got {cooldown:.1f}s"
+        )
+    finally:
+        await http.aclose()
