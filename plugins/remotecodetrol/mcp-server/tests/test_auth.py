@@ -341,3 +341,105 @@ async def test_cached_token_skips_network(fake_keyring, config, jwt_factory):
         )
         token = await client.get_access_token()
     assert token == fresh
+
+
+# ---- v0.3.5: file-based TokenStore (replaces keychain) ----
+
+
+def test_token_store_writes_file_with_0600_perms(_isolated_token_path, fake_keyring, config):
+    """Roundtrip writes a file at the configured path with 0600 perms.
+
+    Path-stable storage is the v0.3.5 fix for the keychain-ACL re-link
+    issue (macOS Keychain ACLs are bound to binary path; plugin reinstall
+    changes path; binary loses access; user has to re-link). 0600 perms
+    are the substitute for keychain's built-in encryption — see auth.py
+    `_default_token_file_path` for the trade-off rationale.
+    """
+    import os
+    store = TokenStore(config.keychain_service)
+    store.set_active_email("user@example.com")
+    store.set_refresh_token("user@example.com", "refresh_xyz")
+
+    assert _isolated_token_path.exists(), "token file should be created"
+    perms = _isolated_token_path.stat().st_mode & 0o777
+    assert perms == 0o600, f"expected 0600, got {oct(perms)}"
+
+    # Cross-instance read confirms persistence.
+    store2 = TokenStore(config.keychain_service)
+    assert store2.get_active_email() == "user@example.com"
+    assert store2.get_refresh_token("user@example.com") == "refresh_xyz"
+
+
+def test_token_store_migrates_from_keychain_on_first_read(
+    _isolated_token_path, fake_keyring, config
+):
+    """First read with no file but populated keychain triggers migration.
+
+    Regression for the v0.3.5 motivation: existing v0.3.4 users have
+    their refresh token in keychain. After plugin update to v0.3.5, the
+    new MCP at a fresh install path can't read keychain (the very ACL
+    issue we're fixing) — but the FakeKeyring in tests has no such ACL,
+    so we verify the happy-path migration: keychain populated → file
+    created → keychain entries deleted.
+    """
+    import keyring
+    # Pre-seed keychain as if v0.3.4 had stored these.
+    keyring.set_password(config.keychain_service, "__active_email__", "user@example.com")
+    keyring.set_password(config.keychain_service, "user@example.com", "refresh_legacy")
+    assert not _isolated_token_path.exists()
+
+    store = TokenStore(config.keychain_service)
+    # First read triggers migration.
+    assert store.get_active_email() == "user@example.com"
+    assert store.get_refresh_token("user@example.com") == "refresh_legacy"
+
+    # File exists with the migrated content.
+    assert _isolated_token_path.exists()
+
+    # Keychain entries were cleaned up (no stale duplicates).
+    assert keyring.get_password(config.keychain_service, "__active_email__") is None
+    assert keyring.get_password(config.keychain_service, "user@example.com") is None
+
+
+def test_token_store_skips_migration_when_keychain_empty(
+    _isolated_token_path, fake_keyring, config
+):
+    """Empty keychain → no migration attempt → empty store, no file written."""
+    store = TokenStore(config.keychain_service)
+    assert store.get_active_email() is None
+    # Migration was attempted but found nothing; no file should exist.
+    assert not _isolated_token_path.exists()
+
+
+def test_token_store_skips_migration_when_keychain_inaccessible(
+    _isolated_token_path, monkeypatch, config
+):
+    """If keyring throws (the production failure mode), migration is
+    silently skipped — user just has to re-link once. The store still
+    works for fresh writes after that."""
+    import keyring
+    def boom(*a, **kw):
+        raise RuntimeError("keychain ACL denied access")
+    monkeypatch.setattr(keyring, "get_password", boom)
+    monkeypatch.setattr(keyring, "set_password", boom)
+    monkeypatch.setattr(keyring, "delete_password", boom)
+
+    store = TokenStore(config.keychain_service)
+    # Migration silently failed; store is empty.
+    assert store.get_active_email() is None
+    # Fresh writes still work.
+    store.set_active_email("new@example.com")
+    store.set_refresh_token("new@example.com", "refresh_new")
+    assert store.get_active_email() == "new@example.com"
+
+
+def test_token_store_clear_removes_only_target_email(
+    _isolated_token_path, fake_keyring, config
+):
+    """Clear is per-email; other emails' tokens persist."""
+    store = TokenStore(config.keychain_service)
+    store.set_refresh_token("a@example.com", "ra")
+    store.set_refresh_token("b@example.com", "rb")
+    store.clear("a@example.com")
+    assert store.get_refresh_token("a@example.com") is None
+    assert store.get_refresh_token("b@example.com") == "rb"

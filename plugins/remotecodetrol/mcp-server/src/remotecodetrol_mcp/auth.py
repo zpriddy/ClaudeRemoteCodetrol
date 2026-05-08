@@ -22,16 +22,24 @@ from a chat conversation:
 from __future__ import annotations
 
 import sys
+import json
+import logging
+import os
+import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import httpx
 import jwt
-import keyring
+import keyring  # kept for one-time migration from keychain (v0.3.5)
 
 from .config import Config
 from .state import read_state, update_state
+
+
+logger = logging.getLogger("remotecodetrol_mcp.auth")
 
 
 ACTIVE_EMAIL_ACCOUNT = "__active_email__"
@@ -95,35 +103,167 @@ def _expiry_from_access_token(access_token: str) -> float:
     return float(exp)
 
 
-class TokenStore:
-    """Thin wrapper over `keyring` for refresh-token persistence."""
+def _default_token_file_path() -> Path:
+    """Stable, plugin-version-independent path for the tokens file.
 
-    def __init__(self, service: str):
+    macOS Keychain ACLs are bound to the calling binary's path. Plugin
+    reinstalls put the MCP at a new path each time
+    (`/cache/.../0.3.X/mcp-server/...`), so the new binary loses access
+    to keychain entries written by previous versions. By storing tokens
+    in a path-stable JSON file under the user's data dir, we avoid that
+    re-link-after-every-update churn.
+
+    Trade-off: file is plain JSON with `chmod 600` rather than encrypted
+    at rest. For the threat model (single-user dev machine, FileVault),
+    this is equivalent — anything running as the user can prompt+read
+    keychain too. See SKILL.md / commit message for the rationale.
+    """
+    if sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support" / "RemoteCodetrol"
+    else:
+        xdg = os.environ.get("XDG_CONFIG_HOME")
+        base = Path(xdg) if xdg else Path.home() / ".config"
+        base = base / "remotecodetrol"
+    return base / "tokens.json"
+
+
+class TokenStore:
+    """File-based refresh-token persistence at a path-stable location.
+
+    v0.3.5+: switched from `keyring` to a JSON file because macOS Keychain
+    ACLs are bound to the calling binary's path. Plugin reinstalls put
+    the MCP at a new versioned path each time, and the new binary loses
+    access to the existing keychain entry — forcing a re-link on every
+    plugin update. File-based storage is path-stable.
+
+    On first read, transparently migrates any existing keychain entries
+    over to the file (one-time, best-effort). After migration, the
+    keychain entries are deleted to avoid stale duplication.
+    """
+
+    def __init__(self, service: str, path: Path | None = None):
         self.service = service
+        self.path = path or _default_token_file_path()
+        # Migration is lazy — on first read — so construction stays
+        # side-effect-free for tests.
+        self._migrated = False
+
+    # ---- public API (unchanged signature) ----
 
     def get_active_email(self) -> str | None:
-        return keyring.get_password(self.service, ACTIVE_EMAIL_ACCOUNT)
+        return self._read().get("active_email") or None
 
     def set_active_email(self, email: str) -> None:
-        keyring.set_password(self.service, ACTIVE_EMAIL_ACCOUNT, email)
+        data = self._read()
+        data["active_email"] = email
+        self._write(data)
 
     def get_refresh_token(self, email: str) -> str | None:
-        return keyring.get_password(self.service, email)
+        tokens = self._read().get("tokens")
+        if not isinstance(tokens, dict):
+            return None
+        val = tokens.get(email)
+        return val if isinstance(val, str) and val else None
 
     def set_refresh_token(self, email: str, refresh_token: str) -> None:
-        keyring.set_password(self.service, email, refresh_token)
+        data = self._read()
+        tokens = data.get("tokens")
+        if not isinstance(tokens, dict):
+            tokens = {}
+            data["tokens"] = tokens
+        tokens[email] = refresh_token
+        self._write(data)
 
     def clear(self, email: str) -> None:
-        try:
-            keyring.delete_password(self.service, email)
-        except keyring.errors.PasswordDeleteError:
-            pass
+        data = self._read()
+        tokens = data.get("tokens")
+        if isinstance(tokens, dict):
+            tokens.pop(email, None)
+        self._write(data)
 
     def clear_active_email(self) -> None:
+        data = self._read()
+        data.pop("active_email", None)
+        self._write(data)
+
+    # ---- file I/O ----
+
+    def _read(self) -> dict[str, Any]:
+        if not self._migrated:
+            self._migrated = True
+            self._maybe_migrate_from_keychain()
+        if not self.path.exists():
+            return {}
         try:
-            keyring.delete_password(self.service, ACTIVE_EMAIL_ACCOUNT)
-        except keyring.errors.PasswordDeleteError:
-            pass
+            with self.path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning("TokenStore: read of %s failed: %s", self.path, e)
+            return {}
+
+    def _write(self, data: dict[str, Any]) -> None:
+        """Atomic, 0600-permissioned write."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(self.path.parent, 0o700)
+        except OSError:
+            pass  # Best-effort; defense in depth.
+        # Atomic: write to .tmp, fsync, rename. Open with 0600 from the
+        # start so the temp file is never world-readable mid-write.
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.path)
+        except Exception:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise
+
+    # ---- one-time migration from keychain ----
+
+    def _maybe_migrate_from_keychain(self) -> None:
+        """One-time, best-effort migration of existing keychain entries.
+
+        If the tokens file already exists, we're past migration. Otherwise
+        try to read keychain; if there's a usable entry, write it to the
+        file and delete the keychain copy so we don't leave duplicates.
+        """
+        if self.path.exists():
+            return
+        try:
+            active = keyring.get_password(self.service, ACTIVE_EMAIL_ACCOUNT)
+            if not active:
+                return
+            refresh = keyring.get_password(self.service, active)
+            if not refresh:
+                return
+            self._write(
+                {"active_email": active, "tokens": {active: refresh}}
+            )
+            logger.info(
+                "TokenStore: migrated tokens from keychain to %s (one-time)",
+                self.path,
+            )
+            for account in (ACTIVE_EMAIL_ACCOUNT, active):
+                try:
+                    keyring.delete_password(self.service, account)
+                except keyring.errors.PasswordDeleteError:
+                    pass
+                except Exception as e:
+                    logger.debug(
+                        "TokenStore: post-migration keychain cleanup failed (%s)", e
+                    )
+        except Exception as e:
+            # Keychain might be inaccessible (path-ACL is the very issue
+            # we're fixing). Don't crash; user just re-links once.
+            logger.info("TokenStore: keychain migration skipped (%s)", e)
 
 
 class AuthClient:

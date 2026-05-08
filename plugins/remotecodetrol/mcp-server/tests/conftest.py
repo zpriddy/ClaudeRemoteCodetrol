@@ -37,6 +37,24 @@ class FakeKeyring:
         del self.store[(service, account)]
 
 
+@pytest.fixture(autouse=True)
+def _isolated_token_path(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    """Redirect TokenStore's default path to a tmp dir for every test.
+
+    Without this, TokenStore would write to
+    `~/Library/Application Support/RemoteCodetrol/tokens.json` for tests
+    that construct it without an explicit path — polluting the developer's
+    real auth state. The fixture is `autouse` so individual tests don't
+    have to remember to apply it.
+    """
+    import remotecodetrol_mcp.auth as auth_mod
+    test_token_path = tmp_path / "tokens.json"
+    monkeypatch.setattr(
+        auth_mod, "_default_token_file_path", lambda: test_token_path
+    )
+    return test_token_path
+
+
 @pytest.fixture
 def fake_keyring(monkeypatch: pytest.MonkeyPatch) -> FakeKeyring:
     fake = FakeKeyring()
