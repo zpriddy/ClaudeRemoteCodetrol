@@ -1,7 +1,7 @@
 {
   "name": "remotecodetrol",
   "description": "Send iOS push notifications and poll for replies via the RemoteCodetrol app — useful before destructive ops, after long-running tasks, or any time you're stuck and want the user to weigh in from their phone.",
-  "version": "0.3.8",
+  "version": "0.3.9",
   "author": {
     "name": "Zachary Priddy",
     "email": "anthropic@zpriddy.com"

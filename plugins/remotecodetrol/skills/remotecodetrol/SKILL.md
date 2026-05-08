@@ -63,43 +63,60 @@ reply landed on your thread, the next Claude message acknowledges it.
 
 Keep messages tight: a one-line status plus the question. Markdown is rendered.
 
-## Waiting for a reply — prefer ending the turn (v0.3.0+)
+## Waiting for a reply — `send_message` blocks by default (v0.3.9+)
 
-After `send_message(..., require_response=True)`, **prefer ending your
-turn** rather than blocking with `wait_for_response`. In v0.3.0+, replies
-stream into the MCP cache via SSE within ~1s of the user tapping send,
-and the `UserPromptSubmit` hook injects pending replies as
-`additionalContext` on the user's next prompt in this terminal.
+`send_message(..., require_response=True)` **blocks until the reply
+arrives** (or `timeout_minutes` elapses). One tool call sends the
+message AND awaits the answer. The user can step fully away from the
+terminal — even leave their Mac entirely — and Claude will resume
+within ~1s of their phone reply landing in Firestore. The MCP's SSE
+consumer is essentially a cron loop waiting for the reply event;
+the `send_message` tool just doesn't return until that loop fires.
 
-**Default pattern (recommended):**
+**Default pattern (recommended for almost every case):**
 
-1. `send_message(body=..., require_response=True)`.
-2. **Tell the user explicitly** how to wake you up. Add to your turn-end
-   message something like: *"I'll watch for your reply on the phone.
-   When you're ready for me to continue, type anything here (even just
-   'continue' or '👍') and your reply will be in my context."* This is
-   load-bearing — without it, the user may not realize they need to type
-   in this terminal to trigger the next Claude turn.
-3. **End the turn.** No `wait_for_response`.
-4. On the user's next prompt, the hook injects their reply as
-   `additionalContext`. Acknowledge + ack it as usual (see "Read &
-   process pending replies").
+```
+result = send_message(
+    body="should I deploy?",
+    require_response=True,
+)
+# When this returns, result.pending_messages has the reply.
+# Process it and continue.
+```
 
-**Use blocking `wait_for_response` only when ALL of:**
+That's it. No `wait_for_response`, no hook dependency, no
+"tell-the-user-to-type-here" instructions. Claude is paused inside
+the tool call; on reply, the tool returns and Claude continues.
 
-- You're in an autonomous loop where the user typing here would
-  interrupt your task.
-- The reply is needed within minutes (bound with `timeout_minutes`).
-- Blocking the current tool call is genuinely better than ending the
-  turn — usually it isn't, because users prefer to interject freely.
+**`wait_for_response` is rarely needed now.** It exists for the case
+where you sent earlier with `wait=False` (or `require_response=False`)
+and now want to block-wait separately.
 
-`wait_for_response` is now push-driven (SSE event-based, ~1s wake
-latency), not polling. The `poll_interval_seconds` parameter is accepted
-for backward compat but ignored. Default timeout is 10 minutes,
-overridable per-call or via `REMOTECODETROL_DEFAULT_TIMEOUT_MINUTES`.
+**`wait=False` opts out of blocking** for pure-status messages:
+```
+send_message(body="build done", require_response=False)
+# Returns immediately, no waiting.
+```
 
-If a `wait_for_response` timeout fires with no reply, summarize current
-state in your final message and stop — don't spin forever.
+Or when you want to send-without-blocking but still expect a reply
+("FYI, I'm doing X — interrupt if needed"):
+```
+send_message(body="...", require_response=True, wait=False)
+# Returns immediately; reply will land in cache and the hook will
+# inject it on the user's next prompt (when they're back at terminal).
+```
+
+**The UserPromptSubmit hook is a backstop, not the primary mechanism.**
+If a reply arrives while Claude is between turns (e.g., after a `wait=False`
+send, or unsolicited chat from the user), the next prompt the user types
+in the terminal will arrive with the reply pre-injected as
+`additionalContext`. Useful when it works; **do not rely on it as a
+substitute for blocking** — if the user is fully away from the terminal,
+the hook never fires.
+
+If a `send_message` blocking call times out with no reply, summarize
+current state in your final message and stop — don't spin forever.
+Default timeout is 10 minutes; override with `timeout_minutes`.
 
 ## Cross-session discipline — only ack your active thread
 

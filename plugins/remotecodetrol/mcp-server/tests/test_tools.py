@@ -7,6 +7,7 @@ client at an httpx MockTransport, and call tools through the FastMCP
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from pathlib import Path
@@ -118,6 +119,10 @@ async def test_send_message_uses_active_thread(
             "send_message",
             body="hello",
             require_response=True,
+            # v0.3.9+: skip the new blocking-wait behavior. This test is
+            # about the POST shape, not the wait. There's a dedicated
+            # test for the wait path.
+            wait=False,
             idempotency_key="k1",
         )
         # v0.3.0 snake_case response shape (spec Appendix A).
@@ -640,5 +645,96 @@ async def test_ack_messages_persists_state_file_after_proactive_prune(
         assert "t" not in write_calls[0], (
             f"acked message should NOT appear in persisted state: {write_calls[0]}"
         )
+    finally:
+        await http.aclose()
+
+
+async def test_send_message_blocks_for_reply_when_wait_true(
+    fake_keyring, config, jwt_factory, tmp_path
+):
+    """v0.3.9 default: send_message(require_response=True) blocks until a
+    reply lands in the cache, then returns it bundled. This is the
+    behavioral fix for the "user steps away, hook never fires" failure
+    mode — we make Claude wait inside the tool call rather than ending
+    the turn."""
+
+    def h(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and "/messages" in request.url.path:
+            # Send succeeds, no pending bundled (simulating "no reply yet").
+            return httpx.Response(
+                201, json={"messageId": "out1", "pending_messages": [], "pending_count": 0}
+            )
+        return httpx.Response(404)
+
+    streaming = StreamingState()
+    mcp, http, _ = await _build_mcp(
+        h, fake_keyring, config, jwt_factory, tmp_path, streaming=streaming
+    )
+    try:
+        await _call(mcp, "set_thread", name="t")
+
+        # Start the send as a task so we can simulate a phone reply
+        # mid-call. With wait=True (default) and require_response=True,
+        # the tool will block in `_await_reply_for_thread` since there's
+        # no pending in cache yet.
+        send_task = asyncio.create_task(
+            _call(
+                mcp,
+                "send_message",
+                body="need decision",
+                require_response=True,
+                timeout_minutes=0.05,  # 3s — generous for a fake event
+            )
+        )
+
+        # Give the send a moment to POST and enter the wait.
+        await asyncio.sleep(0.1)
+
+        # Simulate the SSE consumer adding a reply to the cache.
+        streaming.pending["t"] = [
+            {"id": "reply_1", "thread_id": "t", "body": "do it", "sender_type": "user"}
+        ]
+        streaming.bump()
+
+        out = await asyncio.wait_for(send_task, timeout=2)
+        assert out["message_id"] == "out1"
+        assert out["pending_count"] == 1
+        assert out["pending_messages"][0]["id"] == "reply_1"
+        assert out["pending_messages"][0]["body"] == "do it"
+    finally:
+        await http.aclose()
+
+
+async def test_send_message_skips_wait_when_explicitly_disabled(
+    fake_keyring, config, jwt_factory, tmp_path
+):
+    """wait=False short-circuits the new blocking behavior. Caller can
+    end the turn and rely on the hook (or call wait_for_response
+    later)."""
+
+    def h(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and "/messages" in request.url.path:
+            return httpx.Response(
+                201, json={"messageId": "out2", "pending_messages": [], "pending_count": 0}
+            )
+        # If wait_for_response is called, this would 404 — and the test
+        # would hang or error. Asserting NO GET is fired is the point.
+        return httpx.Response(404)
+
+    streaming = StreamingState()
+    mcp, http, _ = await _build_mcp(
+        h, fake_keyring, config, jwt_factory, tmp_path, streaming=streaming
+    )
+    try:
+        await _call(mcp, "set_thread", name="t")
+        out = await _call(
+            mcp,
+            "send_message",
+            body="just an FYI",
+            require_response=True,
+            wait=False,  # opt out of blocking
+        )
+        assert out["message_id"] == "out2"
+        assert out["pending_count"] == 0  # didn't wait → no reply yet
     finally:
         await http.aclose()

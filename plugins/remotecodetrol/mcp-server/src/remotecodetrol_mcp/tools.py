@@ -208,6 +208,53 @@ def register_tools(
     def _streaming_status() -> str:
         return streaming.sse_status if streaming else "disabled"
 
+    async def _await_reply_for_thread(
+        tid: str, timeout_minutes: float
+    ) -> tuple[list[Message], str]:
+        """Block until a reply lands on `tid`, or timeout. Returns
+        `(messages, source)` where source is "cache" | "api" — same shape
+        as PeekResult but tuple to keep the helper composable.
+
+        Used by both wait_for_response and (v0.3.9+) send_message with
+        wait=True. Behavior:
+          - Cache fresh + already has pending → immediate cache return
+          - SSE unavailable (no streaming / auth_failed / disabled) →
+            single direct-API check, no polling. Returns whatever's there.
+          - Otherwise → block on streaming.state_change, re-check on
+            each wake, until timeout.
+        """
+        deadline = time.monotonic() + float(timeout_minutes) * 60
+
+        # Already have something cached → instant return.
+        if streaming is not None and streaming.pending.get(tid):
+            cached = streaming.pending.get(tid, [])
+            return [Message.model_validate(m) for m in cached], "cache"
+
+        # Streaming unavailable → single API peek, no waiting.
+        if streaming is None or streaming.sse_status in ("auth_failed", "disabled"):
+            data = await api.get(
+                f"/threads/{tid}/messages", params={"unackedOnly": "true"}
+            )
+            msgs = [Message.model_validate(m) for m in _messages_from_api(data)]
+            return msgs, "api"
+
+        # Push-driven wait on state_change. Clear-before-wait avoids
+        # missing mutations that happened between checks.
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return [], "cache"
+            streaming.state_change.clear()
+            if streaming.sse_status == "auth_failed":
+                return [], "cache"
+            cached = streaming.pending.get(tid, [])
+            if cached:
+                return [Message.model_validate(m) for m in cached], "cache"
+            try:
+                await asyncio.wait_for(streaming.state_change.wait(), timeout=remaining)
+            except asyncio.TimeoutError:
+                return [], "cache"
+
     @mcp.tool
     async def set_thread(name: str) -> SetThreadResult:
         """Set the active thread for subsequent send_message / peek / ack calls.
@@ -224,15 +271,31 @@ def register_tools(
     async def send_message(
         body: str,
         require_response: bool = False,
+        wait: bool = True,
+        timeout_minutes: float | None = None,
         thread: str | None = None,
         idempotency_key: str | None = None,
     ) -> SendResult:
         """Send a message to the user via the RemoteCodetrol iOS app.
 
         Set `require_response=True` when you need a reply before continuing.
-        The response now bundles `pending_messages` (any unacked replies on
-        the thread at send time), so Claude usually doesn't need to call
-        peek separately.
+        With `wait=True` (default), this call BLOCKS until either a reply
+        arrives on `thread` (push-driven, ~1s wake) or `timeout_minutes`
+        elapses. With `wait=False`, returns immediately after sending and
+        Claude is responsible for either calling `wait_for_response`
+        explicitly or relying on the next-prompt hook injection.
+
+        Why blocking-by-default in v0.3.9+: hooks only fire when the user
+        types in the terminal. If they're stepped away (the whole point of
+        the app), the hook never fires and Claude is dead until they
+        return. Blocking here closes that gap — Claude stays in this tool
+        call while the MCP's SSE consumer awaits the reply, and resumes
+        instantly when it lands. Effectively a "cron loop" but expressed
+        as one tool call rather than periodic re-checks.
+
+        The response always includes `pending_messages` (any unacked
+        replies on the thread at send time, plus any newly-arrived ones
+        if `wait=True` blocked).
         """
         tid = _resolve_thread(state, thread)
         payload: dict[str, Any] = {"body": body, "requireResponse": require_response}
@@ -243,14 +306,25 @@ def register_tools(
         msg_id = normalized.get("messageId") or normalized.get("message_id")
         raw_pending = normalized.get("pending_messages") or []
         pending = [Message.model_validate(m) for m in raw_pending]
-        count = normalized.get("pending_count")
-        if count is None:
-            count = len(pending)
+
+        # v0.3.9: block until reply if asked. Skip the wait if the bundle
+        # already has something — that's our reply, no need to wait for
+        # another. Skip if !require_response (no reply expected) or
+        # !wait (caller opted out).
+        if require_response and wait and not pending:
+            timeout = (
+                timeout_minutes
+                if timeout_minutes is not None
+                else config.default_timeout_minutes
+            )
+            awaited, _source = await _await_reply_for_thread(tid, timeout)
+            pending = awaited
+
         return SendResult(
             message_id=msg_id or "",
             thread=tid,
             pending_messages=pending,
-            pending_count=int(count),
+            pending_count=len(pending),
         )
 
     @mcp.tool
@@ -351,45 +425,8 @@ def register_tools(
             if timeout_minutes is not None
             else config.default_timeout_minutes
         )
-        deadline = time.monotonic() + float(timeout) * 60
-
-        # If we already have something cached, return immediately.
-        if streaming is not None and streaming.pending.get(tid):
-            cached = streaming.pending.get(tid, [])
-            msgs = [Message.model_validate(m) for m in cached]
-            return PeekResult(messages=msgs, cursor=None, source="cache")
-
-        # Streaming unavailable → single direct-API check, no polling.
-        if streaming is None or streaming.sse_status in ("auth_failed", "disabled"):
-            data = await api.get(
-                f"/threads/{tid}/messages", params={"unackedOnly": "true"}
-            )
-            msgs = [Message.model_validate(m) for m in _messages_from_api(data)]
-            cursor = data.get("cursor") if isinstance(data, dict) else None
-            return PeekResult(messages=msgs, cursor=cursor, source="api")
-
-        # Otherwise wait on the state-change event. We clear() before each
-        # wait so a stale "set" left over from a prior mutation doesn't
-        # cause spurious wake loops.
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return PeekResult(messages=[], cursor=None, source="cache")
-            streaming.state_change.clear()
-            # Re-check after clearing — if a mutation happened between the
-            # last cache read and now, we'd otherwise miss it.
-            if streaming.sse_status == "auth_failed":
-                return PeekResult(messages=[], cursor=None, source="cache")
-            cached = streaming.pending.get(tid, [])
-            if cached:
-                msgs = [Message.model_validate(m) for m in cached]
-                return PeekResult(messages=msgs, cursor=None, source="cache")
-            try:
-                await asyncio.wait_for(streaming.state_change.wait(), timeout=remaining)
-            except asyncio.TimeoutError:
-                return PeekResult(messages=[], cursor=None, source="cache")
-            # Loop and re-check after wakeup. Spurious wakes (mutation on a
-            # different thread) just retry the cache lookup.
+        msgs, source = await _await_reply_for_thread(tid, float(timeout))
+        return PeekResult(messages=msgs, cursor=None, source=source)
 
     @mcp.tool
     async def whoami() -> WhoamiResult:
