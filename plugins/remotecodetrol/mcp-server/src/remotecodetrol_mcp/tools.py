@@ -271,7 +271,7 @@ def register_tools(
     async def send_message(
         body: str,
         require_response: bool = False,
-        wait: bool = True,
+        wait: bool = False,
         timeout_minutes: float | None = None,
         thread: str | None = None,
         idempotency_key: str | None = None,
@@ -279,23 +279,28 @@ def register_tools(
         """Send a message to the user via the RemoteCodetrol iOS app.
 
         Set `require_response=True` when you need a reply before continuing.
-        With `wait=True` (default), this call BLOCKS until either a reply
-        arrives on `thread` (push-driven, ~1s wake) or `timeout_minutes`
-        elapses. With `wait=False`, returns immediately after sending and
-        Claude is responsible for either calling `wait_for_response`
-        explicitly or relying on the next-prompt hook injection.
+        With `wait=False` (default), returns immediately after sending —
+        Claude continues its turn, and the reply will land via either:
+          - the UserPromptSubmit hook on the user's next prompt (whether
+            they type it or some external automation injects it via tmux,
+            cron, watch-mode, etc.), OR
+          - a subsequent peek_messages / wait_for_response call by Claude.
 
-        Why blocking-by-default in v0.3.9+: hooks only fire when the user
-        types in the terminal. If they're stepped away (the whole point of
-        the app), the hook never fires and Claude is dead until they
-        return. Blocking here closes that gap — Claude stays in this tool
-        call while the MCP's SSE consumer awaits the reply, and resumes
-        instantly when it lands. Effectively a "cron loop" but expressed
-        as one tool call rather than periodic re-checks.
+        With `wait=True`, this call BLOCKS inside the tool until the reply
+        arrives or `timeout_minutes` elapses. Use only when Claude truly
+        cannot do anything useful until the answer comes back — and when
+        you're willing to freeze the session for the duration.
 
-        The response always includes `pending_messages` (any unacked
-        replies on the thread at send time, plus any newly-arrived ones
-        if `wait=True` blocked).
+        Why non-blocking-by-default (v0.3.10+): blocking pauses the entire
+        Claude session, which is fine for one-shot interactive use but
+        breaks workflows where prompts flow in from multiple sources
+        (tmux pipes, cron, parallel sessions). The hook delivers replies
+        on ANY UserPromptSubmit, not just terminal-typed ones, so external
+        automation keeps Claude responsive.
+
+        The response always includes `pending_messages` — any unacked
+        replies on the thread at send time, plus newly-arrived ones if
+        `wait=True` blocked.
         """
         tid = _resolve_thread(state, thread)
         payload: dict[str, Any] = {"body": body, "requireResponse": require_response}

@@ -63,60 +63,64 @@ reply landed on your thread, the next Claude message acknowledges it.
 
 Keep messages tight: a one-line status plus the question. Markdown is rendered.
 
-## Waiting for a reply — `send_message` blocks by default (v0.3.9+)
+## Waiting for a reply — `send_message` is non-blocking by default (v0.3.10+)
 
-`send_message(..., require_response=True)` **blocks until the reply
-arrives** (or `timeout_minutes` elapses). One tool call sends the
-message AND awaits the answer. The user can step fully away from the
-terminal — even leave their Mac entirely — and Claude will resume
-within ~1s of their phone reply landing in Firestore. The MCP's SSE
-consumer is essentially a cron loop waiting for the reply event;
-the `send_message` tool just doesn't return until that loop fires.
+`send_message(..., require_response=True)` returns immediately. The
+session stays responsive while the user thinks. Replies are delivered
+via TWO complementary mechanisms — both work without Claude doing
+anything special:
 
-**Default pattern (recommended for almost every case):**
+1. **The UserPromptSubmit hook** (primary delivery mechanism). On every
+   prompt submitted to this session — whether the user typed it OR
+   external automation injected it (tmux pipes, cron, watch-mode,
+   parallel-task scripts) — the hook reads the MCP's pending state
+   file and injects pending replies as `additionalContext`. Claude
+   sees the reply at the top of its next turn without calling any tool.
+
+2. **Bundled `pending_messages` in tool responses.** Every
+   `send_message` returns includes `pending_messages` from the cache.
+   Already-pending replies show up at the top of the response.
+
+Why this is safe: the hook fires on ANY prompt source. If you have
+tmux/cron/external-script automation feeding prompts in, the hook
+delivers replies as part of those prompts. If the user is fully
+away with no automation, the reply still lands in the cache + state
+file; the next time anything triggers a prompt to this session, it
+gets injected.
+
+**Default pattern:**
 
 ```
 result = send_message(
     body="should I deploy?",
     require_response=True,
 )
-# When this returns, result.pending_messages has the reply.
-# Process it and continue.
+# Tool returns immediately. Claude continues its turn.
+# If `result.pending_messages` is empty, no reply yet — that's fine,
+# Claude can do other work, end the turn, etc. Reply will arrive via
+# the hook on a future prompt.
 ```
 
-That's it. No `wait_for_response`, no hook dependency, no
-"tell-the-user-to-type-here" instructions. Claude is paused inside
-the tool call; on reply, the tool returns and Claude continues.
+**Use `wait=True` only when ALL of:**
+- Claude truly cannot do any other useful work until the reply arrives.
+- No external prompt automation is expected to feed this session.
+- Freezing the session for the wait duration is acceptable.
 
-**`wait_for_response` is rarely needed now.** It exists for the case
-where you sent earlier with `wait=False` (or `require_response=False`)
-and now want to block-wait separately.
-
-**`wait=False` opts out of blocking** for pure-status messages:
 ```
-send_message(body="build done", require_response=False)
-# Returns immediately, no waiting.
-```
-
-Or when you want to send-without-blocking but still expect a reply
-("FYI, I'm doing X — interrupt if needed"):
-```
-send_message(body="...", require_response=True, wait=False)
-# Returns immediately; reply will land in cache and the hook will
-# inject it on the user's next prompt (when they're back at terminal).
+result = send_message(
+    body="confirm: drop database X?",
+    require_response=True,
+    wait=True,  # blocks the session inside this tool call
+    timeout_minutes=5,
+)
 ```
 
-**The UserPromptSubmit hook is a backstop, not the primary mechanism.**
-If a reply arrives while Claude is between turns (e.g., after a `wait=False`
-send, or unsolicited chat from the user), the next prompt the user types
-in the terminal will arrive with the reply pre-injected as
-`additionalContext`. Useful when it works; **do not rely on it as a
-substitute for blocking** — if the user is fully away from the terminal,
-the hook never fires.
+`wait_for_response` exists for the "I sent earlier with wait=False
+and now I genuinely need to block-wait" case. Rare.
 
-If a `send_message` blocking call times out with no reply, summarize
-current state in your final message and stop — don't spin forever.
-Default timeout is 10 minutes; override with `timeout_minutes`.
+If a `wait=True` call times out with no reply, summarize current state
+and stop — don't spin forever. Default timeout is 10 minutes;
+override with `timeout_minutes`.
 
 ## Cross-session discipline — only ack your active thread
 

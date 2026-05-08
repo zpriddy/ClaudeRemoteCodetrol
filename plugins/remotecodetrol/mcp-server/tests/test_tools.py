@@ -683,6 +683,7 @@ async def test_send_message_blocks_for_reply_when_wait_true(
                 "send_message",
                 body="need decision",
                 require_response=True,
+                wait=True,  # v0.3.10: explicit opt-in to blocking
                 timeout_minutes=0.05,  # 3s — generous for a fake event
             )
         )
