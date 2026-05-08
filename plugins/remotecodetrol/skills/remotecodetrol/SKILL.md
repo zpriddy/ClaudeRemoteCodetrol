@@ -122,83 +122,87 @@ If a `wait=True` call times out with no reply, summarize current state
 and stop — don't spin forever. Default timeout is 10 minutes;
 override with `timeout_minutes`.
 
-## Set up a self-poll loop for long waits with no other prompt source
+## Stay in checking mode once activated — until user says stop or 2h idle
 
-The hook injects pending replies on **any** UserPromptSubmit. If the
-session has external prompt automation (tmux pipes, cron, watch-mode,
-parallel scripts), those keep the hook firing — replies get delivered
-naturally. Claude doesn't need to do anything special.
+**This is a hard rule, not case-by-case.**
 
-**But if Claude is ending its turn and nothing else will prompt the
-session for a long time** — no user typing, no automation — the reply
-sits in the cache + state file forever. To fix this without blocking
-(which would freeze the session), Claude can self-poll using Claude
-Code's **built-in `loop` skill** (NOT `ralph-loop:ralph-loop`, which
-is a different mechanism — Ralph fires the same prompt back-to-back
-on every exit, no time interval, designed for "agent grinds until
-done" patterns).
+When EITHER of these happens, you enter **CHECKING MODE**:
+- You make any `send_message(..., require_response=True)` call.
+- The user explicitly asks you to notify them on their phone (e.g.
+  "ping me when X is done", "let me know via the app").
 
-Invoke via the Skill tool:
+Once in checking mode, **you MUST keep a recurring poll running**
+for replies. Do not end the session assuming the hook will deliver.
+Do not skip the loop because the user is at the terminal — terminal
+interaction can stop at any time; the loop can't.
 
-```
-Skill: loop
-Args: 5m peek messages from remotecodetrol on the active thread and
-      process any pending. End turn quickly if nothing pending.
-```
+### The contract
 
-The `loop` skill parses the leading `5m` as the interval, schedules a
-recurring CronCreate job under the hood, and runs the prompt once
-immediately. Every iteration:
-1. Triggers UserPromptSubmit → fires our hook → injects pending
-   replies as `additionalContext`.
-2. Claude runs the prompt body (peek_messages or similar) for
-   belt-and-suspenders cache check.
-3. If replies are pending, Claude acks them and **cancels the loop**
-   via `CronDelete` (job ID is in the loop's confirmation message).
+1. **At activation** (first `require_response=True` send, or first
+   "notify me" request), immediately set up a recurring poll via
+   the built-in `loop` skill:
 
-**Important constraints (from CronCreate):**
-- **Minimum effective interval is `1m`.** Cron's granularity is
-  one minute, so `30s` silently rounds up to `*/1 * * * *`. If you
-  want sub-minute polling, you need `wait=True` instead.
+   ```
+   Skill: loop
+   Args: 1m peek messages from remotecodetrol on the active thread.
+         Process any pending per the read/decide/communicate/ack
+         rule. If `~/Library/Caches/remotecodetrol/pending.json`
+         has `updated_at` older than 2 hours AND no pending
+         replies, that's the idle timeout — send a final
+         "timing out, no reply for 2h" via send_message and
+         CronDelete this loop's job. Otherwise end turn.
+   ```
+
+   Use the **built-in `loop` skill**, NOT `ralph-loop:ralph-loop`
+   (different mechanism — Ralph is fire-on-exit with no interval).
+   `1m` is the minimum cron granularity and the right default;
+   anything shorter silently rounds up.
+
+2. **Keep polling until ONE of** these stop conditions:
+   - **User explicitly says stop.** Phrases like "stop polling",
+     "we're done", "cancel the loop", "no more notifications",
+     equivalent. Cancel via `CronDelete` and confirm the cancel.
+   - **2 hours pass since the last activity** on the active thread.
+     Track via `pending.json` `updated_at` (the SSE consumer
+     rewrites this file on every cache mutation, so it advances
+     whenever a reply lands or is acked). When `updated_at` is
+     > 2h old AND `pending` is empty: 2h of silence. Send a final
+     timeout summary, then `CronDelete`.
+
+3. **A new reply RESETS the 2h clock** automatically. The SSE
+   consumer updates `pending.json.updated_at` on every change, so
+   the next iteration sees a fresh timestamp.
+
+4. **A new `send_message(require_response=True)` mid-loop** does
+   NOT need a second loop — the existing one already covers any
+   pending on the active thread. Don't stack loops.
+
+5. **Cancel the loop only on** the two stop conditions above.
+   Don't cancel because "the user is at the terminal" or "the hook
+   will catch it" or "I'm tired of seeing iterations." Those
+   assumptions are exactly what break the user's mental model
+   that "I asked Claude to watch my phone, so it's watching."
+
+### Constraints (from CronCreate)
+
+- **1-minute minimum cadence.** Cron granularity is 1 minute; any
+  finer requires `wait=True` instead of a loop.
 - **Session-scoped by default** — the cron dies when Claude Code
-  exits. For waits that should survive across sessions, use the
+  exits. For waits that need to survive restarts, use the
   `schedule` skill (cloud-based, durable) or pass `durable=true`
   to CronCreate directly.
-- **Auto-expires after 7 days** — bounds runaway loops.
+- **Auto-expires after 7 days** — backstop against truly stuck
+  loops; the 2h idle rule should fire long before this.
 
-**When to set up a self-poll:**
-- `send_message(require_response=True, wait=False)` (default).
-- Claude is ending the turn after sending.
-- Reply may take longer than the user's typical response cadence
-  (overnight wait, user is in a meeting, etc.).
-- No external automation is expected to prompt the session.
+### When NOT in checking mode
 
-**Loop interval choice:**
-- `5m` — good default for "user might reply in minutes-to-hours".
-- `1m` — minimum useful; for time-critical decisions where you'd
-  otherwise have used `wait=True`.
-- self-paced (no interval) — Claude decides when to re-check;
-  uses ScheduleWakeup instead of CronCreate. Best when the cadence
-  needs to vary based on context.
+If you've never sent `require_response=True` and the user hasn't
+asked for phone notification, you don't need a loop. A
+fire-and-forget `send_message(require_response=False)` is just a
+status update — no reply expected, no polling needed.
 
-**Don't set up a loop when:**
-- External prompt automation is already feeding the session.
-- The user is actively at the terminal (their typing IS the cron).
-- `wait=True` would be more appropriate (decision is blocking
-  everything else anyway).
-
-For one-shot deferred checks rather than recurring, use the
-`schedule` skill:
-
-```
-Skill: schedule
-Args: in 1 hour, peek messages on remotecodetrol
-```
-
-**Always cancel the loop when the reply is processed.** The job ID
-is returned by CronCreate when the `loop` skill creates it; pass it
-to `CronDelete`. Forgetting to cancel = the loop keeps polling for
-up to 7 days. Cheap (cache lookups) but noisy in your transcript.
+For one-shot deferred reminders ("remind me in an hour"), use the
+`schedule` skill rather than a recurring loop.
 
 ## Cross-session discipline — only ack your active thread
 
