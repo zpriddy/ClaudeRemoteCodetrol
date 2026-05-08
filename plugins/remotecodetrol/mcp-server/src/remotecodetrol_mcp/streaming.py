@@ -376,7 +376,11 @@ class SseConsumer:
                 pass
 
     async def _connect_and_consume(self) -> None:
-        url = f"{self.config.api_v1}/stream"
+        # Use config.stream_url, NOT api_v1 — the stream endpoint is a
+        # separate Cloud Function (e.g. /stream), not a route under the api
+        # function (which would be /api/v1/stream). See config._derive_stream_url
+        # for the derivation rule and the REMOTECODETROL_STREAM_URL override.
+        url = self.config.stream_url
         try:
             token = await self.auth.get_access_token()
         except (NotAuthorizedError, AuthError) as e:

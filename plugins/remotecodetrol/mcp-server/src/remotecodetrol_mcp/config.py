@@ -20,6 +20,7 @@ DEFAULT_TIMEOUT_MINUTES = 10
 @dataclass(frozen=True)
 class Config:
     api_base: str
+    stream_url: str
     default_thread: str | None
     device_label: str
     keychain_service: str
@@ -29,6 +30,29 @@ class Config:
     @property
     def api_v1(self) -> str:
         return f"{self.api_base.rstrip('/')}/v1"
+
+
+def _derive_stream_url(api_base: str) -> str:
+    """Derive the SSE stream endpoint URL from `api_base`.
+
+    The stream endpoint is deployed as a SEPARATE Cloud Function (named
+    `stream`) — not as a route under the api function. Cloud Functions maps
+    each function name to its own URL path, so:
+
+        api function     → https://<region>-<project>.cloudfunctions.net/api
+        stream function  → https://<region>-<project>.cloudfunctions.net/stream
+
+    Both share a host. The api_base typically ends in `/api`; we strip that
+    suffix (if present) and append `/stream` to get the stream URL.
+
+    For non-cloudfunctions deployments (e.g. a single Express server hosting
+    everything behind a reverse proxy), users can set
+    `REMOTECODETROL_STREAM_URL` explicitly to bypass derivation.
+    """
+    base = api_base.rstrip("/")
+    if base.endswith("/api"):
+        base = base[: -len("/api")]
+    return f"{base}/stream"
 
 
 def _default_device_label() -> str:
@@ -41,8 +65,13 @@ def _default_device_label() -> str:
 
 def load_config() -> Config:
     """Build a Config from environment variables (with defaults)."""
+    api_base = os.environ.get("REMOTECODETROL_API_BASE", DEFAULT_API_BASE)
+    stream_url = os.environ.get("REMOTECODETROL_STREAM_URL") or _derive_stream_url(
+        api_base
+    )
     return Config(
-        api_base=os.environ.get("REMOTECODETROL_API_BASE", DEFAULT_API_BASE),
+        api_base=api_base,
+        stream_url=stream_url,
         default_thread=os.environ.get("REMOTECODETROL_THREAD") or None,
         device_label=os.environ.get(
             "REMOTECODETROL_DEVICE_LABEL", _default_device_label()

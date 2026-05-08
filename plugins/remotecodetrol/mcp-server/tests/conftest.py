@@ -51,6 +51,7 @@ def fake_keyring(monkeypatch: pytest.MonkeyPatch) -> FakeKeyring:
 def config() -> Config:
     return Config(
         api_base="https://api.test.invalid",
+        stream_url="https://stream.test.invalid",
         default_thread=None,
         device_label="test-device",
         keychain_service="com.remotecodetrol.test",
