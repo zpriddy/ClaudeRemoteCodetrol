@@ -210,21 +210,47 @@ async def test_connected_event_does_not_mutate(fake_keyring, config):
         await http.aclose()
 
 
-async def test_run_exits_on_auth_failed(fake_keyring, config):
-    """If the AuthClient has no usable credentials, run() exits cleanly
-    rather than spinning."""
+async def test_run_waits_for_link_on_no_token(fake_keyring, config, monkeypatch):
+    """No token in keychain → status `waiting_for_link`, consumer keeps
+    running so the user's /remotecodetrol:link can write a token without
+    requiring a Claude Code restart.
+
+    Regression for the v0.3.2-and-earlier double-restart bug, where this
+    case set status=auth_failed and exited the consumer permanently.
+    """
+    # Make the no-token retry sleep tiny so the test is fast.
+    import remotecodetrol_mcp.streaming as streaming_mod
+    monkeypatch.setattr(streaming_mod, "WAITING_FOR_LINK_RETRY_S", 0.05)
 
     state = StreamingState()
     transport = httpx.MockTransport(lambda r: httpx.Response(200, json={}))
     http = httpx.AsyncClient(transport=transport)
     store = TokenStore(config.keychain_service)
     auth = AuthClient(config, http, store)
-    # Don't seed any credentials — get_access_token will raise NotAuthorizedError.
+    # Don't seed any credentials — get_access_token will raise
+    # NotAuthorizedError, which the consumer should NOT treat as terminal.
     consumer = SseConsumer(config, auth, http, state)
     try:
-        # Run with a very short fuse — it should exit on its own.
+        run_task = asyncio.create_task(consumer.run())
+        # Give the consumer a couple of retry cycles to reach
+        # waiting_for_link state.
+        for _ in range(10):
+            await asyncio.sleep(0.02)
+            if state.sse_status == "waiting_for_link":
+                break
+
+        assert state.sse_status == "waiting_for_link", (
+            f"expected waiting_for_link, got {state.sse_status} — "
+            "regression of double-restart bug"
+        )
+        assert not run_task.done(), (
+            "consumer must keep running while waiting for link "
+            "(it used to exit permanently in v0.3.2 and earlier)"
+        )
+
+        # Now stop the consumer to clean up. It should exit cleanly.
+        await consumer.stop()
         async with asyncio.timeout(2):
-            await consumer.run()
-        assert state.sse_status == "auth_failed"
+            await run_task
     finally:
         await http.aclose()

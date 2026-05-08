@@ -51,9 +51,17 @@ SseStatus = Literal[
     "connecting",
     "connected",
     "reconnecting",
-    "auth_failed",
+    "waiting_for_link",  # No token in keychain yet — fresh install or post-logout
+    "auth_failed",  # Refresh token revoked by server — terminal until /relink
     "disabled",
 ]
+
+
+# Backoff (in seconds) when the SSE loop is waiting for the user to link.
+# Longer than connection-error backoff because we expect this to persist on
+# user-time (seconds-to-minutes), not millis. Short enough that re-link is
+# noticed quickly.
+WAITING_FOR_LINK_RETRY_S = 10.0
 
 
 @dataclass
@@ -375,6 +383,32 @@ class SseConsumer:
                 self.state.bump()
                 logger.error("SSE auth revoked; consumer exiting permanently")
                 return
+            except _NoTokenSentinel:
+                # No token in keychain yet — user hasn't linked, or token
+                # was deleted. Don't exit; wait for /remotecodetrol:link to
+                # write a fresh token and try again. This is the
+                # double-restart-fix: in v0.3.2 and earlier, this case was
+                # conflated with auth_revoked and the consumer exited
+                # permanently, requiring a Claude Code restart after link.
+                self.state.sse_status = "waiting_for_link"
+                self.state.bump()
+                # Reset attempt count — we're not in an exponential-backoff
+                # connection-failure mode; we're idle waiting for an
+                # external trigger.
+                attempt = 0
+                retry_hint_ms = None
+                logger.info(
+                    "SSE: no token; waiting %.0fs for link",
+                    WAITING_FOR_LINK_RETRY_S,
+                )
+                try:
+                    await asyncio.wait_for(
+                        self._stop.wait(), timeout=WAITING_FOR_LINK_RETRY_S
+                    )
+                    return  # _stop fired during sleep
+                except asyncio.TimeoutError:
+                    pass
+                continue
             except _RetryHintSentinel as e:
                 retry_hint_ms = e.retry_ms
                 attempt += 1
@@ -407,8 +441,20 @@ class SseConsumer:
         url = self.config.stream_url
         try:
             token = await self.auth.get_access_token()
-        except (NotAuthorizedError, AuthError) as e:
-            logger.info("SSE: no usable token (%s); pausing", e)
+        except NotAuthorizedError as e:
+            # No token in keychain (fresh install / post-logout). NOT
+            # terminal: the user might run /remotecodetrol:link in this
+            # same session, after which the next retry will succeed.
+            # Distinguished from AuthError below to avoid the
+            # double-restart bug from v0.3.2 — see run()'s
+            # _NoTokenSentinel handler.
+            logger.info("SSE: no token in keychain (%s); waiting for link", e)
+            raise _NoTokenSentinel()
+        except AuthError as e:
+            # Refresh token rejected by the backend. Terminal — the user
+            # needs to explicitly relink (the existing refresh token is
+            # invalid and we have no way to recover in-process).
+            logger.warning("SSE: refresh token revoked (%s); pausing consumer", e)
             self.state.sse_status = "auth_failed"
             self.state.bump()
             raise _AuthRevokedSentinel()
@@ -580,6 +626,16 @@ def _normalize_message(payload: dict[str, Any]) -> dict[str, Any]:
 
 class _AuthRevokedSentinel(Exception):
     """Tell the run loop to exit permanently — token can't be recovered."""
+
+
+class _NoTokenSentinel(Exception):
+    """Tell the run loop to wait for an out-of-process /link to write a token.
+
+    Distinguished from `_AuthRevokedSentinel` because they need different
+    handling: revoked refresh-token is terminal (the consumer has no way
+    to recover without explicit user action), but "no token yet" is
+    expected on fresh installs and clears as soon as `/link` completes.
+    """
 
 
 class _RetryHintSentinel(Exception):
