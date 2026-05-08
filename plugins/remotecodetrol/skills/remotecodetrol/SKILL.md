@@ -8,6 +8,20 @@ description: Use when sending status notifications to the user via the RemoteCod
 When you need to notify the user or request input, use the `remotecodetrol`
 MCP. The user receives a push on their iPhone and replies from the app.
 
+## v0.3.0 — replies may arrive as injected context between turns
+
+As of v0.3.0, the plugin streams replies in the background and surfaces
+them via a `UserPromptSubmit` hook: when the user sends a reply on their
+phone while you're idle, the next turn opens with that reply already
+visible to you as `additionalContext` (no `peek_messages` call required).
+
+When you see "Messages received from user via RemoteCodetrol while you
+were idle:" injected into your context, the read/decide/communicate
+rule below still applies — process each one, fold relevant content
+into your reply, and **`ack_messages([...])` them even though you didn't
+explicitly `peek_messages`**. Acking marks the user's reply as seen so
+it doesn't re-surface on every future turn.
+
 ## Read & process pending replies before sending — ALWAYS
 
 **Before every `send_message` call, peek the queue and *process* any

@@ -17,6 +17,7 @@ from fastmcp import FastMCP
 
 from remotecodetrol_mcp.auth import AuthClient, TokenBundle, TokenStore
 from remotecodetrol_mcp.client import APIClient
+from remotecodetrol_mcp.streaming import StreamingState
 from remotecodetrol_mcp.tools import ThreadState, register_tools
 
 
@@ -29,7 +30,10 @@ def _bundle(access: str, email: str = "user@example.com") -> TokenBundle:
     )
 
 
-async def _build_mcp(handler, fake_keyring, config, jwt_factory, tmp_path: Path):
+async def _build_mcp(
+    handler, fake_keyring, config, jwt_factory, tmp_path: Path,
+    *, streaming: StreamingState | None = None,
+):
     # State file lives in state.py now (shared between auth + tools).
     # Patch its module-level STATE_PATH directly so reads/writes are
     # isolated to a tmp file for this test.
@@ -45,7 +49,7 @@ async def _build_mcp(handler, fake_keyring, config, jwt_factory, tmp_path: Path)
     state = ThreadState(config)
 
     mcp = FastMCP("test-rcct")
-    register_tools(mcp, api, state, config)
+    register_tools(mcp, api, state, config, streaming=streaming)
     return mcp, http, state
 
 
@@ -116,8 +120,12 @@ async def test_send_message_uses_active_thread(
             require_response=True,
             idempotency_key="k1",
         )
-        assert out["messageId"] == "msg_123"
+        # v0.3.0 snake_case response shape (spec Appendix A).
+        assert out["message_id"] == "msg_123"
         assert out["thread"] == "alerts"
+        # Old backend without bundling → empty pending list, count 0.
+        assert out["pending_count"] == 0
+        assert out["pending_messages"] == []
         assert captured["path"].endswith("/v1/threads/alerts/messages")
         assert captured["body"] == {
             "body": "hello",
@@ -283,33 +291,106 @@ async def test_whoami(fake_keyring, config, jwt_factory, tmp_path):
     def h(_):
         return httpx.Response(404)
 
-    mcp, http, state = await _build_mcp(h, fake_keyring, config, jwt_factory, tmp_path)
+    streaming = StreamingState()
+    streaming.sse_status = "connected"
+    mcp, http, state = await _build_mcp(
+        h, fake_keyring, config, jwt_factory, tmp_path, streaming=streaming,
+    )
     try:
         state.set("primary")
         out = await _call(mcp, "whoami")
         assert out["email"] == "user@example.com"
-        assert out["default_thread"] == "primary"
+        assert out["active_thread"] == "primary"
+        assert out["sse_status"] == "connected"
+        assert out["plugin_version"]
+        assert isinstance(out["pending_count_by_thread"], dict)
     finally:
         await http.aclose()
 
 
-async def test_wait_for_response_returns_messages(
-    fake_keyring, config, jwt_factory, tmp_path, monkeypatch
+async def test_wait_for_response_returns_immediately_when_event_fires(
+    fake_keyring, config, jwt_factory, tmp_path
 ):
-    poll_counter = {"n": 0}
+    """v0.3.0: wait_for_response awaits state_change, doesn't poll."""
+    import asyncio
+
+    def h(_):
+        return httpx.Response(404)  # never used
+
+    streaming = StreamingState()
+    streaming.sse_status = "connected"
+
+    mcp, http, _ = await _build_mcp(
+        h, fake_keyring, config, jwt_factory, tmp_path, streaming=streaming,
+    )
+    try:
+        await _call(mcp, "set_thread", name="t")
+
+        async def fire_after_short_delay():
+            await asyncio.sleep(0.05)
+            streaming.add_message({
+                "id": "m9",
+                "thread_id": "t",
+                "body": "go",
+                "sender_type": "user",
+                "created_at": "2026-05-05T13:00:00Z",
+            })
+
+        producer = asyncio.create_task(fire_after_short_delay())
+        out = await _call(
+            mcp,
+            "wait_for_response",
+            timeout_minutes=1,
+            poll_interval_seconds=1,  # v0.2.4 back-compat kwarg, ignored
+        )
+        await producer
+        assert len(out["messages"]) == 1
+        assert out["messages"][0]["id"] == "m9"
+        assert out["source"] == "cache"
+    finally:
+        await http.aclose()
+
+
+async def test_wait_for_response_timeout_returns_empty(
+    fake_keyring, config, jwt_factory, tmp_path
+):
+    def h(_):
+        return httpx.Response(200, json={"messages": [], "cursor": None})
+
+    streaming = StreamingState()
+    streaming.sse_status = "connected"
+    mcp, http, _ = await _build_mcp(
+        h, fake_keyring, config, jwt_factory, tmp_path, streaming=streaming,
+    )
+    try:
+        await _call(mcp, "set_thread", name="t")
+        # 0-minute timeout — returns immediately with empty list.
+        out = await _call(
+            mcp,
+            "wait_for_response",
+            timeout_minutes=0,
+            poll_interval_seconds=1,  # ignored; v0.2.4 back-compat
+        )
+        assert out["messages"] == []
+    finally:
+        await http.aclose()
+
+
+async def test_wait_for_response_falls_back_to_api_when_streaming_disabled(
+    fake_keyring, config, jwt_factory, tmp_path
+):
+    seen: list[str] = []
 
     def h(request: httpx.Request) -> httpx.Response:
-        if request.method == "GET":
-            poll_counter["n"] += 1
-            if poll_counter["n"] < 2:
-                return httpx.Response(200, json={"messages": [], "cursor": None})
+        seen.append(request.url.path)
+        if "/messages" in request.url.path:
             return httpx.Response(
                 200,
                 json={
                     "messages": [
                         {
-                            "id": "m9",
-                            "body": "go",
+                            "id": "m1",
+                            "body": "hi",
                             "senderType": "user",
                             "createdAt": "2026-05-05T13:00:00Z",
                         }
@@ -317,58 +398,198 @@ async def test_wait_for_response_returns_messages(
                     "cursor": None,
                 },
             )
-        return httpx.Response(200, json={})  # ack
+        return httpx.Response(200, json={})
 
-    async def _no_sleep(_):
-        return None
-
-    monkeypatch.setattr("remotecodetrol_mcp.tools.asyncio.sleep", _no_sleep)
-    mcp, http, _ = await _build_mcp(h, fake_keyring, config, jwt_factory, tmp_path)
+    streaming = StreamingState()
+    streaming.sse_status = "disabled"
+    mcp, http, _ = await _build_mcp(
+        h, fake_keyring, config, jwt_factory, tmp_path, streaming=streaming,
+    )
     try:
         await _call(mcp, "set_thread", name="t")
-        out = await _call(
-            mcp,
-            "wait_for_response",
-            timeout_minutes=1,
-            poll_interval_seconds=1,
-        )
+        out = await _call(mcp, "wait_for_response", timeout_minutes=1)
         assert len(out["messages"]) == 1
-        m0 = out["messages"][0]
-        assert (m0.get("messageId") or m0.get("id")) == "m9"
+        assert out["source"] == "api"
+        assert any("/messages" in p for p in seen)
     finally:
         await http.aclose()
 
 
-async def test_wait_for_response_timeout_returns_empty(
-    fake_keyring, config, jwt_factory, tmp_path, monkeypatch
+async def test_peek_uses_cache_when_fresh(
+    fake_keyring, config, jwt_factory, tmp_path
 ):
     def h(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"messages": [], "cursor": None})
+        # If we hit the API, the test fails — cache should be used.
+        raise AssertionError(f"unexpected API call: {request.url.path}")
 
-    async def _no_sleep(_):
-        return None
+    streaming = StreamingState()
+    streaming.sse_status = "connected"
+    streaming.add_message({
+        "id": "msg1",
+        "thread_id": "t",
+        "body": "cached",
+        "sender_type": "user",
+        "created_at": "2026-05-05T13:00:00Z",
+    })
 
-    # Force monotonic to advance past the deadline so the loop exits.
-    real_monotonic = time.monotonic
-    start = real_monotonic()
-    fake_clock = {"t": start}
-
-    def fake_monotonic():
-        fake_clock["t"] += 100
-        return fake_clock["t"]
-
-    monkeypatch.setattr("remotecodetrol_mcp.tools.asyncio.sleep", _no_sleep)
-    monkeypatch.setattr("remotecodetrol_mcp.tools.time.monotonic", fake_monotonic)
-
-    mcp, http, _ = await _build_mcp(h, fake_keyring, config, jwt_factory, tmp_path)
+    mcp, http, _ = await _build_mcp(
+        h, fake_keyring, config, jwt_factory, tmp_path, streaming=streaming,
+    )
     try:
         await _call(mcp, "set_thread", name="t")
-        out = await _call(
-            mcp,
-            "wait_for_response",
-            timeout_minutes=1,
-            poll_interval_seconds=1,
+        peek = await _call(mcp, "peek_messages")
+        assert len(peek["messages"]) == 1
+        assert peek["messages"][0]["id"] == "msg1"
+        assert peek["source"] == "cache"
+    finally:
+        await http.aclose()
+
+
+async def test_peek_falls_back_to_api_when_cache_stale(
+    fake_keyring, config, jwt_factory, tmp_path
+):
+    seen: list[str] = []
+
+    def h(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        return httpx.Response(
+            200,
+            json={
+                "messages": [
+                    {
+                        "id": "from-api",
+                        "body": "hi",
+                        "senderType": "user",
+                        "createdAt": "2026-05-05T13:00:00Z",
+                    }
+                ],
+                "cursor": None,
+            },
         )
-        assert out["messages"] == []
+
+    streaming = StreamingState()
+    # Disconnected and last_event_at far in the past → cache is stale.
+    streaming.sse_status = "disconnected"
+    streaming.last_event_at = time.monotonic() - 999.0
+
+    mcp, http, _ = await _build_mcp(
+        h, fake_keyring, config, jwt_factory, tmp_path, streaming=streaming,
+    )
+    try:
+        await _call(mcp, "set_thread", name="t")
+        peek = await _call(mcp, "peek_messages")
+        assert peek["messages"][0]["id"] == "from-api"
+        assert peek["source"] == "api"
+        assert any("/messages" in p for p in seen)
+    finally:
+        await http.aclose()
+
+
+async def test_peek_all_threads_with_star(
+    fake_keyring, config, jwt_factory, tmp_path
+):
+    def h(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"all-threads peek must be cache-only: {request.url.path}")
+
+    streaming = StreamingState()
+    streaming.sse_status = "connected"
+    streaming.add_message({"id": "a1", "thread_id": "alpha", "body": "1"})
+    streaming.add_message({"id": "b1", "thread_id": "beta", "body": "2"})
+
+    mcp, http, _ = await _build_mcp(
+        h, fake_keyring, config, jwt_factory, tmp_path, streaming=streaming,
+    )
+    try:
+        peek = await _call(mcp, "peek_messages", thread="*")
+        ids = sorted(m["id"] for m in peek["messages"])
+        assert ids == ["a1", "b1"]
+    finally:
+        await http.aclose()
+
+
+async def test_ack_prunes_cache_on_2xx(
+    fake_keyring, config, jwt_factory, tmp_path
+):
+    def h(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and "/ack" in request.url.path:
+            return httpx.Response(200, json={})
+        return httpx.Response(404)
+
+    streaming = StreamingState()
+    streaming.sse_status = "connected"
+    streaming.add_message({"id": "msg1", "thread_id": "t", "body": "x"})
+    streaming.add_message({"id": "msg2", "thread_id": "t", "body": "y"})
+
+    mcp, http, _ = await _build_mcp(
+        h, fake_keyring, config, jwt_factory, tmp_path, streaming=streaming,
+    )
+    try:
+        await _call(mcp, "set_thread", name="t")
+        ack = await _call(mcp, "ack_messages", message_ids=["msg1"])
+        assert ack["acked"] == 1
+        # Cache pruned: only msg2 remains.
+        remaining = streaming.pending.get("t", [])
+        assert [m["id"] for m in remaining] == ["msg2"]
+    finally:
+        await http.aclose()
+
+
+async def test_ack_does_not_prune_on_failure(
+    fake_keyring, config, jwt_factory, tmp_path
+):
+    from remotecodetrol_mcp.client import APIError
+
+    def h(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and "/ack" in request.url.path:
+            return httpx.Response(500, text="boom")
+        return httpx.Response(404)
+
+    streaming = StreamingState()
+    streaming.sse_status = "connected"
+    streaming.add_message({"id": "msg1", "thread_id": "t", "body": "x"})
+
+    mcp, http, _ = await _build_mcp(
+        h, fake_keyring, config, jwt_factory, tmp_path, streaming=streaming,
+    )
+    try:
+        await _call(mcp, "set_thread", name="t")
+        with pytest.raises(Exception):
+            await _call(mcp, "ack_messages", message_ids=["msg1"])
+        # Cache is untouched on failure (§5).
+        assert [m["id"] for m in streaming.pending.get("t", [])] == ["msg1"]
+    finally:
+        await http.aclose()
+
+
+async def test_send_message_returns_bundled_pending(
+    fake_keyring, config, jwt_factory, tmp_path
+):
+    def h(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            201,
+            json={
+                "messageId": "out1",
+                "pending_messages": [
+                    {
+                        "id": "in1",
+                        "thread_id": "alerts",
+                        "body": "reply!",
+                        "sender_type": "user",
+                        "created_at": "2026-05-05T12:00:00Z",
+                    }
+                ],
+                "pending_count": 1,
+            },
+        )
+
+    mcp, http, _ = await _build_mcp(
+        h, fake_keyring, config, jwt_factory, tmp_path,
+    )
+    try:
+        await _call(mcp, "set_thread", name="alerts")
+        out = await _call(mcp, "send_message", body="hi")
+        assert out["message_id"] == "out1"
+        assert out["pending_count"] == 1
+        assert out["pending_messages"][0]["id"] == "in1"
     finally:
         await http.aclose()
