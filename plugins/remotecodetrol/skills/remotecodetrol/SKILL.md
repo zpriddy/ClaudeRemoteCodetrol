@@ -122,6 +122,63 @@ If a `wait=True` call times out with no reply, summarize current state
 and stop — don't spin forever. Default timeout is 10 minutes;
 override with `timeout_minutes`.
 
+## Set up a self-poll loop for long waits with no other prompt source
+
+The hook injects pending replies on **any** UserPromptSubmit. If the
+session has external prompt automation (tmux pipes, cron, watch-mode,
+parallel scripts), those keep the hook firing — replies get delivered
+naturally. Claude doesn't need to do anything special.
+
+**But if Claude is ending its turn and nothing else will prompt the
+session for a long time** — no user typing, no automation — the reply
+sits in the cache + state file forever. To fix this without blocking
+(which would freeze the session), Claude should set up a self-poll
+loop using Claude Code's `/loop` skill:
+
+```
+/loop 5m peek_messages
+```
+
+This re-invokes `peek_messages` every 5 minutes in the same session.
+Each invocation:
+1. Triggers the UserPromptSubmit hook (pending replies inject as
+   `additionalContext`).
+2. Returns the cache state to Claude (a no-op cost when nothing's
+   pending — local lookup, zero network).
+
+When the reply arrives, the next loop iteration delivers it. Claude
+processes it, acks, and **cancels the loop** (`/cancel-ralph` or the
+equivalent) so it doesn't keep polling forever.
+
+**When to set up a self-poll:**
+- Sending with `require_response=True, wait=False` (default).
+- Claude is ending the turn after sending.
+- The reply might take longer than the user's typical response cadence
+  (e.g., overnight wait, user is in a meeting).
+- No external automation is expected to prompt the session.
+
+**Loop interval choice:**
+- `5m` — good default for "user might reply in minutes-to-hours"
+- `30s` — for time-critical decisions where you'd otherwise have used `wait=True`
+- self-paced (omit interval) — Claude decides when to re-check
+
+**Don't set up a loop when:**
+- An external prompt source is already feeding the session.
+- The user is actively at the terminal (their typing IS the cron).
+- `wait=True` would be more appropriate (decision is blocking
+  everything else anyway).
+
+For one-shot deferred checks rather than recurring, use the
+`schedule` skill:
+
+```
+Skill: schedule
+Args: in 1 hour, peek_messages on remotecodetrol
+```
+
+Either way, the session stays responsive between checks — no blocking,
+no dependency on the user's manual prompts.
+
 ## Cross-session discipline — only ack your active thread
 
 If multiple Claude Code sessions are running for the same user, each
