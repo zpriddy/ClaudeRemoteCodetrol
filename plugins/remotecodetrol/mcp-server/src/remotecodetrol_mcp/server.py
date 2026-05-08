@@ -59,30 +59,28 @@ else:
 register_tools(mcp, _API, _STATE, CONFIG, streaming=_STREAMING)
 
 
-def _have_credentials() -> bool:
-    """Return True if a refresh token is available without prompting.
-
-    We only spawn the SSE consumer eagerly when we already have something
-    to connect with — otherwise the consumer would just loop on
-    NotAuthorizedError and burn CPU.
-    """
-    try:
-        store = _AUTH.store
-        email = store.get_active_email()
-        if not email:
-            return False
-        return store.get_refresh_token(email) is not None
-    except Exception:
-        return False
-
-
 async def _on_startup() -> None:
-    """Spawn the SSE consumer if we can. Errors are logged but never fatal."""
+    """Spawn the SSE consumer unconditionally.
+
+    v0.3.7: removed the prior `_have_credentials()` gate. Pre-0.3.7,
+    if there were no creds at MCP startup we skipped the spawn — but
+    that meant a fresh install had to:
+      1. Start MCP (no creds, consumer not spawned)
+      2. Run /remotecodetrol:link (token written to file)
+      3. Restart Claude Code so a NEW MCP process spawns the consumer
+    The "restart twice" friction we hit through v0.3.0–0.3.6.
+
+    The streaming.py run loop is already resilient to no-creds-at-runtime
+    (v0.3.3): it raises `_NoTokenSentinel`, the loop catches it, sets
+    `sse_status = waiting_for_link`, sleeps `WAITING_FOR_LINK_RETRY_S`
+    (10s), and retries. Once the user links, the next retry sees the
+    fresh refresh token and connects normally — all in-process, no
+    second restart required.
+
+    The cost of unconditional spawn is one ~10s no-op cycle while
+    waiting for the user to link. Cheap.
+    """
     if _SSE_CONSUMER is None:
-        return
-    if not _have_credentials():
-        # Not yet linked — leave SSE inactive; the user will run
-        # /remotecodetrol:link and a subsequent process can start streaming.
         return
     try:
         _SSE_CONSUMER.start()
