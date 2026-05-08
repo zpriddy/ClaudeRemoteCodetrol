@@ -16,42 +16,42 @@ phone while you're idle, the next turn opens with that reply already
 visible to you as `additionalContext` (no `peek_messages` call required).
 
 When you see "Messages received from user via RemoteCodetrol while you
-were idle:" injected into your context, the read/decide/communicate
-rule below still applies — process each one, fold relevant content
-into your reply, and **`ack_messages([...])` them even though you didn't
-explicitly `peek_messages`**. Acking marks the user's reply as seen so
-it doesn't re-surface on every future turn.
+were idle:" injected into your context:
+
+- Each line is tagged with its thread, e.g. `[thread:test] (2m ago) "..."`.
+- Process the entries on **your active thread** per the rules below —
+  fold relevant content into your reply and call `ack_messages([...])`
+  on those messages.
+- Entries on **other threads** belong to other Claude Code sessions
+  for the same user. **Do not ack them.** Mention briefly in your
+  reply that you saw them but they're not yours to handle (see the
+  "Cross-session discipline" section below).
 
 ## Read & process pending replies before sending — ALWAYS
 
-**Before every `send_message` call, peek the queue and *process* any
-unacked replies. Never silently ack-and-discard.** Replies are crash-safe
-and persist across Claude sessions, so users can send messages between
-Claude's turns or even across separate sessions, and you might be the
-first Claude that sees them.
+**Before every `send_message` call, peek your active thread and *process*
+any unacked replies.** Replies are crash-safe and persist across Claude
+sessions; users can send messages between Claude's turns or across
+separate sessions, and you might be the first Claude that sees them.
 
 The flow:
 
-1. **`peek_messages()`** — see what's pending.
+1. **`peek_messages()`** (no `thread=` argument — use your active thread).
 2. **For each reply, decide:**
    - **Relevant to the current task** → fold it into your reasoning + your
      reply. Reference it explicitly in your next `send_message` body so
      the user knows you read it ("Got your '<quoted snippet>' — yes, doing
      X now").
-   - **Stale or out-of-scope** → still acknowledge it explicitly in your
-     next `send_message` body. Don't pretend you didn't see it. Example:
-     *"Saw your earlier reply '<snippet>' — that looks like context from
-     a different task; flag if you want me to act on it."*
    - **Conversational / no action needed** → a short ack is enough
      ("Got '👍'") so the user knows the system delivered it.
-3. **`ack_messages(message_ids=[...])`** — ack EVERYTHING you peeked,
-   even the stale ones. The user has been informed; they don't need
-   to see the same reply re-surface in a future turn.
+3. **`ack_messages(message_ids=[...])`** — ack the messages you processed.
+   See the **Cross-session discipline** section below for the strict rule
+   on what NOT to ack.
 4. **Then** call your new `send_message`.
 
 The cardinal rule: **the user should always be able to look at the thread
-and see that Claude saw every message they sent.** If a reply went in,
-the next Claude message acknowledges it (briefly is fine).
+and see that Claude saw every message they sent on this thread.** If a
+reply landed on your thread, the next Claude message acknowledges it.
 
 ## When to send
 
@@ -63,24 +63,70 @@ the next Claude message acknowledges it (briefly is fine).
 
 Keep messages tight: a one-line status plus the question. Markdown is rendered.
 
-## Polling for a reply
+## Waiting for a reply — prefer ending the turn (v0.3.0+)
 
-After `send_message(..., require_response=True)`, enter polling mode:
+After `send_message(..., require_response=True)`, **prefer ending your
+turn** rather than blocking with `wait_for_response`. In v0.3.0+, replies
+stream into the MCP cache via SSE within ~1s of the user tapping send,
+and the `UserPromptSubmit` hook injects pending replies as
+`additionalContext` on the user's next prompt in this terminal.
 
-- **Easy path:** call `wait_for_response(timeout_minutes=...)`. It loops
-  `peek_messages` -> `ack_messages` for you and returns the user's reply, or
-  an empty list on timeout. Note: this auto-acks, so the responsibility to
-  *acknowledge in your next send_message body* still applies — wrap the
-  reply content into your reasoning visibly.
-- **Manual path:** `peek_messages()` returns unacked replies. Process each
-  per the rules above, then call `ack_messages(message_ids=[...])`.
+**Default pattern (recommended):**
 
-Default poll interval is 300s and default timeout is 10 minutes; both are
-overridable per-call and via `REMOTECODETROL_DEFAULT_POLL_INTERVAL_SECONDS` /
-`REMOTECODETROL_DEFAULT_TIMEOUT_MINUTES`.
+1. `send_message(body=..., require_response=True)`.
+2. **Tell the user explicitly** how to wake you up. Add to your turn-end
+   message something like: *"I'll watch for your reply on the phone.
+   When you're ready for me to continue, type anything here (even just
+   'continue' or '👍') and your reply will be in my context."* This is
+   load-bearing — without it, the user may not realize they need to type
+   in this terminal to trigger the next Claude turn.
+3. **End the turn.** No `wait_for_response`.
+4. On the user's next prompt, the hook injects their reply as
+   `additionalContext`. Acknowledge + ack it as usual (see "Read &
+   process pending replies").
 
-If the timeout fires with no reply, summarize current state in your final
-message to the user and stop — don't spin forever.
+**Use blocking `wait_for_response` only when ALL of:**
+
+- You're in an autonomous loop where the user typing here would
+  interrupt your task.
+- The reply is needed within minutes (bound with `timeout_minutes`).
+- Blocking the current tool call is genuinely better than ending the
+  turn — usually it isn't, because users prefer to interject freely.
+
+`wait_for_response` is now push-driven (SSE event-based, ~1s wake
+latency), not polling. The `poll_interval_seconds` parameter is accepted
+for backward compat but ignored. Default timeout is 10 minutes,
+overridable per-call or via `REMOTECODETROL_DEFAULT_TIMEOUT_MINUTES`.
+
+If a `wait_for_response` timeout fires with no reply, summarize current
+state in your final message and stop — don't spin forever.
+
+## Cross-session discipline — only ack your active thread
+
+If multiple Claude Code sessions are running for the same user, each
+sees the **same** SSE event stream and may receive the same messages
+in `pending_messages` bundles. **Acking a message removes it from every
+session's cache and marks it processed in Firestore**, so an aggressive
+ack from one session can break the workflow of another session that's
+waiting on the same reply.
+
+The rule:
+
+- **Default to peeking only your active thread.** Omit the `thread=`
+  argument on `peek_messages` — it resolves to whatever `set_thread`
+  / env / call-time chose.
+- **`peek_messages(thread="*")` is diagnostic-only.** If you see
+  messages from threads you aren't working on, mention them in your
+  next `send_message` body ("noticed 'X' on the GasCity thread —
+  different session's territory, leaving it") and **do NOT call
+  `ack_messages` on them.**
+- **Bundled `pending_messages` from `send_message`** may include
+  threads other than your active one. Same rule: acknowledge in
+  your reply body if relevant context, ack only the entries on your
+  active thread.
+- A message on your active thread is yours to process. A message on
+  another thread belongs to whichever Claude Code session is set to
+  that thread.
 
 ## End of every interaction — final peek + ack
 
