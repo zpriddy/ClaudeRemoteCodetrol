@@ -79,6 +79,13 @@ class StreamingState:
     state_change: asyncio.Event = field(default_factory=asyncio.Event)
     active_thread: str | None = None
     last_event_id: str | None = None
+    # v0.4.0: Per-process allowlist of threads this Claude session may see.
+    # SSE events for threads NOT in this set are silently dropped at the
+    # consumer (never cached, never surfaced via tools/hook). Initialised
+    # from REMOTECODETROL_KNOWN_THREADS env var; mutated at runtime via
+    # set_thread, send_message, forget_thread, and the equivalent CLI
+    # subcommands. See spec §5.
+    known_threads: set[str] = field(default_factory=set)
     # Set by SseConsumer at init time. tools.py calls `await persist_now()`
     # after a proactive cache prune (HTTP ack path) so the state file stays
     # in sync — without this, the file lags the cache until SSE delivers a
@@ -101,11 +108,18 @@ class StreamingState:
     # ---- mutators (call from SseConsumer or ack path) ----
 
     def replace_snapshot(self, messages: list[dict[str, Any]]) -> None:
-        """Reset cache to the server's authoritative snapshot."""
+        """Reset cache to the server's authoritative snapshot.
+
+        Filters via `known_threads` (v0.4.0+): events for threads not in
+        the allowlist are silently dropped. They still exist on the
+        server; this Claude session just can't see them.
+        """
         new_pending: dict[str, list[dict[str, Any]]] = {}
         for msg in messages:
             tid = msg.get("thread_id") or msg.get("threadId")
             if not tid:
+                continue
+            if self.known_threads and tid not in self.known_threads:
                 continue
             new_pending.setdefault(tid, []).append(msg)
         # Apply the per-thread cap on snapshot too — backend should already
@@ -123,9 +137,15 @@ class StreamingState:
         self.bump()
 
     def add_message(self, msg: dict[str, Any]) -> bool:
-        """Add a new message; return True if it was actually new."""
+        """Add a new message; return True if it was actually new.
+
+        Filters via `known_threads` (v0.4.0+): events for unknown threads
+        return False (silent drop). Pre-v0.4.0, all messages were accepted.
+        """
         tid = msg.get("thread_id") or msg.get("threadId")
         if not tid:
+            return False
+        if self.known_threads and tid not in self.known_threads:
             return False
         msg_id = msg.get("id")
         bucket = self.pending.setdefault(tid, [])
@@ -187,6 +207,38 @@ class StreamingState:
         for msgs in self.pending.values():
             out.extend(msgs)
         return out
+
+    # ---- known_threads (v0.4.0+) ----
+
+    def add_known_thread(self, name: str) -> bool:
+        """Allow `name` to be visible. Returns True if newly added."""
+        if name in self.known_threads:
+            return False
+        self.known_threads.add(name)
+        # No state-file persistence: known_threads is in-memory by design
+        # (per spec §5.1). Re-derived on each MCP launch.
+        return True
+
+    def forget_known_thread(self, name: str) -> bool:
+        """Remove `name` from the allowlist; drop any cached pending for it.
+
+        Returns True if it was previously known.
+        """
+        if name not in self.known_threads:
+            return False
+        self.known_threads.discard(name)
+        if name in self.pending:
+            self.pending.pop(name, None)
+            self.bump()
+        if self.active_thread == name:
+            self.active_thread = None
+        return True
+
+    def is_thread_known(self, name: str) -> bool:
+        return name in self.known_threads
+
+    def list_known(self) -> list[str]:
+        return sorted(self.known_threads)
 
 
 # ---------- SSE wire parser ----------

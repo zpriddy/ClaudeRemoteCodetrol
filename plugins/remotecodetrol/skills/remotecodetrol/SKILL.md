@@ -8,6 +8,34 @@ description: Use when sending status notifications to the user via the RemoteCod
 When you need to notify the user or request input, use the `remotecodetrol`
 MCP. The user receives a push on their iPhone and replies from the app.
 
+## Use the rcct CLI for routine commands
+
+As of v0.4.0, every routine MCP tool has a Bash equivalent under `rcct`:
+`rcct send`, `rcct check`, `rcct ack`, `rcct wait`, `rcct whoami`,
+`rcct link`, `rcct check-link`, `rcct logout`, and
+`rcct threads {list,allow,forget,known}`. Each maps 1:1 to the
+identically-named MCP tool (`send_message`, `peek_messages`,
+`ack_messages`, `wait_for_response`, `whoami`, `link`, `complete_link`,
+`logout`, `list_threads` / `set_thread` / `forget_thread` /
+`list_known_threads`).
+
+**Prefer the CLI.** Same underlying functions, same `tokens.json`, same SSE
+cache, same `known_threads` set. The CLI is just a thinner surface:
+
+- Smaller token cost — no JSON-RPC envelope to format.
+- Faster round-trip — Unix socket at `~/Library/Caches/remotecodetrol/mcp.sock`,
+  no stdio MCP framing.
+- Single implementation: `@mcp.tool` and the socket dispatcher both call
+  the same Python function.
+
+**Use the MCP tools only when** you need `wait=True` blocking semantics
+inside the call. `rcct wait` is a one-shot peek with a timeout — it
+returns immediately on a hit or after the timeout. It does NOT freeze
+your turn the way `send_message(..., wait=True)` does.
+
+If `rcct` isn't on PATH, the absolute fallback is
+`${CLAUDE_PLUGIN_ROOT}/bin/rcct`.
+
 ## v0.3.0 — replies may arrive as injected context between turns
 
 As of v0.3.0, the plugin streams replies in the background and surfaces
@@ -65,7 +93,9 @@ Keep messages tight: a one-line status plus the question. Markdown is rendered.
 
 ## Waiting for a reply — `send_message` is non-blocking by default (v0.3.10+)
 
-`send_message(..., require_response=True)` returns immediately. The
+`send_message(..., require_response=True)` returns immediately. **`rcct
+send --require-response ...` follows the same model** — fires the message
+and returns; replies arrive via the hook, not via that call. The
 session stays responsive while the user thinks. Replies are delivered
 via TWO complementary mechanisms — both work without Claude doing
 anything special:
@@ -204,32 +234,26 @@ status update — no reply expected, no polling needed.
 For one-shot deferred reminders ("remind me in an hour"), use the
 `schedule` skill rather than a recurring loop.
 
-## Cross-session discipline — only ack your active thread
+## Cross-session discipline — enforced by `known_threads` (v0.4.0+)
 
-If multiple Claude Code sessions are running for the same user, each
-sees the **same** SSE event stream and may receive the same messages
-in `pending_messages` bundles. **Acking a message removes it from every
-session's cache and marks it processed in Firestore**, so an aggressive
-ack from one session can break the workflow of another session that's
-waiting on the same reply.
+As of v0.4.0, cross-session isolation is structurally enforced. The SSE
+consumer drops events for threads not in this session's `known_threads`
+allowlist, so you cannot peek or ack messages from another session's
+threads — you don't see them in the first place. Sending or peeking on
+an unallowed thread errors. See "Picking the thread" above for the
+add/remove API.
 
-The rule:
+The practical implication:
 
-- **Default to peeking only your active thread.** Omit the `thread=`
-  argument on `peek_messages` — it resolves to whatever `set_thread`
-  / env / call-time chose.
-- **`peek_messages(thread="*")` is diagnostic-only.** If you see
-  messages from threads you aren't working on, mention them in your
-  next `send_message` body ("noticed 'X' on the GasCity thread —
-  different session's territory, leaving it") and **do NOT call
-  `ack_messages` on them.**
-- **Bundled `pending_messages` from `send_message`** may include
-  threads other than your active one. Same rule: acknowledge in
-  your reply body if relevant context, ack only the entries on your
-  active thread.
-- A message on your active thread is yours to process. A message on
-  another thread belongs to whichever Claude Code session is set to
-  that thread.
+- Default to peeking your active thread (omit `thread=`).
+- `peek_messages(thread="*")` returns pending across **known threads
+  only** — other sessions' threads are invisible.
+- Ack what you peek. There's no longer a way to accidentally ack
+  another session's reply.
+
+**Legacy note:** pre-v0.4 plugins required honor-system thread
+discipline ("ack only your active thread"); v0.4 enforces it via
+`known_threads`.
 
 ## End of every interaction — final peek + ack
 
@@ -250,13 +274,72 @@ Threads are addressed by name. Resolution priority:
 If none of those are set, `send_message` errors. Call `list_threads()` to see
 what's available, then `set_thread(...)` once at the start of the session.
 
+### v0.4.0 — `set_thread` also adds to `known_threads`
+
+Each MCP process keeps a per-session **`known_threads` allowlist**. The
+SSE consumer drops events for threads that aren't in the set, so they
+never enter your cache or hook injection. **Sending or peeking on an
+unallowed thread errors.** Add/remove paths:
+
+- `set_thread(name)` / `rcct threads allow <name>` — sets active AND adds
+  to `known_threads`.
+- `send_message(thread="foo", ...)` / `rcct send --thread foo ...` —
+  sending IS declaring intent; auto-adds `foo`.
+- `forget_thread(name)` / `rcct threads forget <name>` — drops from the
+  set, clears active if it matched, prunes the cache.
+- `list_known_threads()` / `rcct threads known` — current set.
+- `REMOTECODETROL_KNOWN_THREADS=foo,bar` env var — declarative
+  pre-seeding at MCP launch.
+
+`list_threads()` still returns ALL threads on the backend (discoverability);
+each `ThreadSummary` carries a `known: bool` so you can tell which ones
+are currently visible to this session.
+
 ## First-run authorization
 
 If `whoami()` raises a "Not authorized" error, the user needs to run
-`/remotecodetrol:link`. That returns a `user_code` — show it to them with
-clear instructions to enter it in the iOS app's Settings → "Authorize new
-device". Once they tap Confirm, your next tool call (any tool — `whoami`
-is fine) detects the completed authorization and proceeds.
+`/remotecodetrol:link`. Call `link()` (or `rcct link`). The result includes:
 
-Don't loop / poll waiting for them to authorize — let them run it on
-their schedule and resume on their next prompt.
+- `user_code` — the 6-char code (manual fallback).
+- `qr_ascii` — an ASCII QR code encoding
+  `remotecodetrol://authorize?code=<user_code>`. Scans in the iOS app's
+  Settings → "Authorize new device" → in-app scanner. iPhone Camera will
+  also deep-link once Spec 2 ships.
+- `deep_link` — the URL the QR encodes (for copy/paste cases).
+- `verification_uri` — the web fallback.
+
+**Show BOTH** the QR (in a fenced code block, monospace, so it scans) and
+the `user_code` as backup. Lead with the QR; offer the code as the
+manual path.
+
+````
+```
+<paste qr_ascii here, exactly as returned>
+```
+
+Or enter code **`ABCD-1234`** manually in Settings → Authorize new device.
+````
+
+### Do NOT poll — wait at least 30 seconds
+
+After showing the code, **do NOT call `whoami()` or any other tool to
+check status for at least 30 seconds.** The flow is human-gated (open
+phone, scan or type, tap Confirm). Calling immediately is wasted —
+you'll get `authorization_pending` and burn rate-limit budget. End the
+turn after showing the code; the user's next prompt naturally triggers
+your tools and the new auth state is detected.
+
+### Exception — when the user explicitly confirms
+
+If the user EXPLICITLY says "I confirmed" / "I tapped it" / "done"
+(or equivalent), call `complete_link()` (CLI: `rcct check-link`). This
+hits `/v1/oauth/check-link`, which **bypasses both client-side and
+server-side polling cooldowns** and gives you an immediate answer:
+
+- `status: "authorized"` — you're in; `email` is set.
+- `status: "pending"` — user hasn't actually confirmed yet; ask them
+  to verify they tapped the right button.
+- `status: "expired"` / `"denied"` / `"invalid"` — re-run `link()`.
+
+Use `complete_link()` ONLY when the user explicitly confirms. Otherwise
+respect the 30-second wait above.

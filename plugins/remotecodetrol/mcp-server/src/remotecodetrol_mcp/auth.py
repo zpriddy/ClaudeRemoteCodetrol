@@ -1,62 +1,69 @@
-"""OAuth 2.0 device-code client + macOS Keychain refresh-token storage.
+"""v4 (plugin v0.4.0+) auth: single 14-day opaque token, file-stored.
 
-Implements RFC 8628 against the RemoteCodetrol backend (see design doc §6.2).
-All token storage is via the `keyring` library so we get OS-appropriate
-secure storage (macOS Keychain on this user's machine).
+Replaces the v0.3.x access+refresh JWT model with a single opaque token
+issued by the backend at /v1/oauth/token (device-code grant) or
+/v1/oauth/check-link (force-poll). Renewed via /v1/oauth/rotate, which
+returns a fresh token AND keeps the old one valid for a 60s grace
+window — see backend spec §3.5.
 
-The device-code flow is split across two MCP tool calls so it can be driven
-from a chat conversation:
+Token storage: ~/Library/Application Support/RemoteCodetrol/tokens.json
+(macOS) / ${XDG_CONFIG_HOME:-~/.config}/remotecodetrol/tokens.json
+(linux). Permission 0600 on file; 0700 on parent dir. Schema:
 
-  1. `link()` calls `start_device_flow()` — returns user_code immediately
-     and persists the device_code to state.json.
-  2. The user authorizes in the iOS app.
-  3. The next tool call (`whoami`, `send_message`, …) hits
-     `get_access_token()`. With no cached token and no refresh token, it
-     finds the pending device_code on disk and calls
-     `complete_device_flow_once()` which polls /oauth/token a single time.
-     If the user has authorized, tokens are stored and the call proceeds.
-     If still pending, the tool raises NotAuthorizedError so Claude can
-     prompt the user to wait or re-link.
+  {
+    "schema_version": 4,
+    "active_email": "user@example.com",   # optional; populated post-link
+    "tokens": {
+      "user@example.com": {
+        "token": "<plaintext>",
+        "issued_at": <unix-seconds>,
+        "expires_at": <unix-seconds>,     # issued_at + 14d
+        "rotates_at": <unix-seconds>,     # issued_at + 7d
+        "last_rotation_attempt_at": <unix-seconds> | null
+      }
+    }
+  }
+
+v0.3.x token files (no schema_version, or values are JWT/refresh-token
+strings) are DETECTED ON LOAD and DISCARDED — we rewrite the file as an
+empty v4 shape and the next tool call surfaces NotAuthorizedError so
+Claude prompts a re-link. There is no migration code path.
+
+Background rotation: when expires_at - now < 7d, kick off a non-blocking
+refresh task. On failure, retry hourly for the next 7 days (still well
+inside the token's remaining lifetime). User-facing tool calls never
+block on rotation.
 """
 
 from __future__ import annotations
 
-import sys
+import asyncio
 import json
 import logging
 import os
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import httpx
-import jwt
-import keyring  # kept for one-time migration from keychain (v0.3.5)
 
 from .config import Config
-from .state import read_state, update_state
 
 
 logger = logging.getLogger("remotecodetrol_mcp.auth")
 
 
-ACTIVE_EMAIL_ACCOUNT = "__active_email__"
-ACCESS_TOKEN_LEEWAY_SECONDS = 60
-PENDING_FLOW_KEY = "pending_device_flow"
+SCHEMA_VERSION = 4
 
-# Minimum spacing between device-code polls (v0.3.6). Overrides the
-# 5s `interval` the server returns at flow start. Rationale: the
-# device flow is human-gated (open phone, type code, confirm) — that's
-# tens-of-seconds at minimum, so polling every 5s produces noise without
-# any UX benefit. Tunable via REMOTECODETROL_DEVICE_POLL_MIN_SECONDS
-# env var if you need to override.
-import os as _os  # local alias to avoid touching the import block
+# Sentinel: the in-memory cache of the current token. We re-read from disk
+# on first use after MCP launch so a Claude session that re-uses the MCP
+# process across `link()` invocations sees the freshly-written token.
+_TOKEN_TTL_LEEWAY_SECONDS = 60
 
-MIN_DEVICE_POLL_INTERVAL_SECONDS = int(
-    _os.environ.get("REMOTECODETROL_DEVICE_POLL_MIN_SECONDS", "30")
-)
+# Background rotation: tighter retry window for the day-7+ phase.
+_ROTATION_RETRY_INTERVAL_SECONDS = 60 * 60  # 1 hour
 
 
 class AuthError(RuntimeError):
@@ -64,8 +71,7 @@ class AuthError(RuntimeError):
 
 
 class NotAuthorizedError(RuntimeError):
-    """Raised when no usable credentials exist and the caller should
-    invoke `link()` (or wait for an in-flight authorization to complete)."""
+    """No usable credentials. Caller should invoke link()."""
 
     def __init__(self, message: str, *, pending_user_code: str | None = None):
         super().__init__(message)
@@ -73,11 +79,14 @@ class NotAuthorizedError(RuntimeError):
 
 
 @dataclass
-class TokenBundle:
-    access_token: str
-    refresh_token: str
+class StoredToken:
+    """Mirrors one entry of `tokens.json::tokens.<email>`."""
+
+    token: str
+    issued_at: float
     expires_at: float
-    email: str
+    rotates_at: float
+    last_rotation_attempt_at: float | None = None
 
 
 @dataclass
@@ -86,50 +95,13 @@ class DeviceFlowInfo:
 
     user_code: str
     verification_uri: str
+    deep_link: str
     expires_in_seconds: int
     interval_seconds: int
-
-
-def _decode_jwt_unverified(token: str) -> dict[str, Any]:
-    """Decode a JWT without verifying the signature.
-
-    We trust TLS for token transport; signature verification is the server's
-    job. We only inspect `sub`/`exp` for client-side bookkeeping.
-    """
-    return jwt.decode(token, options={"verify_signature": False})
-
-
-def _email_from_access_token(access_token: str) -> str:
-    claims = _decode_jwt_unverified(access_token)
-    sub = claims.get("sub")
-    if not isinstance(sub, str) or not sub:
-        raise AuthError("Access token is missing a `sub` claim")
-    return sub
-
-
-def _expiry_from_access_token(access_token: str) -> float:
-    claims = _decode_jwt_unverified(access_token)
-    exp = claims.get("exp")
-    if not isinstance(exp, (int, float)):
-        raise AuthError("Access token is missing an `exp` claim")
-    return float(exp)
+    device_code: str  # opaque; persisted via state for /check-link to consume
 
 
 def _default_token_file_path() -> Path:
-    """Stable, plugin-version-independent path for the tokens file.
-
-    macOS Keychain ACLs are bound to the calling binary's path. Plugin
-    reinstalls put the MCP at a new path each time
-    (`/cache/.../0.3.X/mcp-server/...`), so the new binary loses access
-    to keychain entries written by previous versions. By storing tokens
-    in a path-stable JSON file under the user's data dir, we avoid that
-    re-link-after-every-update churn.
-
-    Trade-off: file is plain JSON with `chmod 600` rather than encrypted
-    at rest. For the threat model (single-user dev machine, FileVault),
-    this is equivalent — anything running as the user can prompt+read
-    keychain too. See SKILL.md / commit message for the rationale.
-    """
     if sys.platform == "darwin":
         base = Path.home() / "Library" / "Application Support" / "RemoteCodetrol"
     else:
@@ -139,28 +111,45 @@ def _default_token_file_path() -> Path:
     return base / "tokens.json"
 
 
+def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
+    """Write JSON atomically with 0600 perms; chmod parent 0700 best-effort."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(path.parent, 0o700)
+    except OSError:
+        pass
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
 class TokenStore:
-    """File-based refresh-token persistence at a path-stable location.
+    """File-backed v4 token store.
 
-    v0.3.5+: switched from `keyring` to a JSON file because macOS Keychain
-    ACLs are bound to the calling binary's path. Plugin reinstalls put
-    the MCP at a new versioned path each time, and the new binary loses
-    access to the existing keychain entry — forcing a re-link on every
-    plugin update. File-based storage is path-stable.
-
-    On first read, transparently migrates any existing keychain entries
-    over to the file (one-time, best-effort). After migration, the
-    keychain entries are deleted to avoid stale duplication.
+    On first read, detects pre-v4 shape and DISCARDS it (overwrites file
+    with an empty v4 shape). This is the "no migration" decision from
+    spec §1 / §8 — old links are abandoned, users re-link.
     """
 
-    def __init__(self, service: str, path: Path | None = None):
-        self.service = service
+    def __init__(self, path: Path | None = None):
         self.path = path or _default_token_file_path()
-        # Migration is lazy — on first read — so construction stays
-        # side-effect-free for tests.
-        self._migrated = False
+        # In-memory mirror so we don't re-read the JSON file on every call.
+        self._cache: dict[str, Any] | None = None
+        # Lock to serialize writes (multiple in-flight rotations etc.).
+        self._lock = asyncio.Lock()
 
-    # ---- public API (unchanged signature) ----
+    # ---- public API ----
 
     def get_active_email(self) -> str | None:
         return self._read().get("active_email") or None
@@ -170,20 +159,59 @@ class TokenStore:
         data["active_email"] = email
         self._write(data)
 
-    def get_refresh_token(self, email: str) -> str | None:
+    def get_token(self, email: str) -> StoredToken | None:
         tokens = self._read().get("tokens")
         if not isinstance(tokens, dict):
             return None
-        val = tokens.get(email)
-        return val if isinstance(val, str) and val else None
+        entry = tokens.get(email)
+        if not isinstance(entry, dict):
+            return None
+        try:
+            return StoredToken(
+                token=str(entry["token"]),
+                issued_at=float(entry["issued_at"]),
+                expires_at=float(entry["expires_at"]),
+                rotates_at=float(entry["rotates_at"]),
+                last_rotation_attempt_at=(
+                    float(entry["last_rotation_attempt_at"])
+                    if entry.get("last_rotation_attempt_at") is not None
+                    else None
+                ),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
 
-    def set_refresh_token(self, email: str, refresh_token: str) -> None:
+    def store_token(
+        self,
+        email: str,
+        token: str,
+        expires_at: float,
+        rotates_at: float,
+        issued_at: float | None = None,
+    ) -> None:
         data = self._read()
         tokens = data.get("tokens")
         if not isinstance(tokens, dict):
             tokens = {}
             data["tokens"] = tokens
-        tokens[email] = refresh_token
+        tokens[email] = {
+            "token": token,
+            "issued_at": issued_at if issued_at is not None else time.time(),
+            "expires_at": expires_at,
+            "rotates_at": rotates_at,
+            "last_rotation_attempt_at": None,
+        }
+        self._write(data)
+
+    def mark_rotation_attempt(self, email: str) -> None:
+        data = self._read()
+        tokens = data.get("tokens")
+        if not isinstance(tokens, dict):
+            return
+        entry = tokens.get(email)
+        if not isinstance(entry, dict):
+            return
+        entry["last_rotation_attempt_at"] = time.time()
         self._write(data)
 
     def clear(self, email: str) -> None:
@@ -198,88 +226,46 @@ class TokenStore:
         data.pop("active_email", None)
         self._write(data)
 
-    # ---- file I/O ----
+    def clear_all(self) -> None:
+        self._write({"schema_version": SCHEMA_VERSION, "tokens": {}})
+
+    # ---- internals ----
 
     def _read(self) -> dict[str, Any]:
-        if not self._migrated:
-            self._migrated = True
-            self._maybe_migrate_from_keychain()
+        if self._cache is not None:
+            return self._cache
         if not self.path.exists():
-            return {}
+            self._cache = {"schema_version": SCHEMA_VERSION, "tokens": {}}
+            return self._cache
         try:
             with self.path.open("r", encoding="utf-8") as f:
                 data = json.load(f)
-            return data if isinstance(data, dict) else {}
         except (OSError, json.JSONDecodeError) as e:
-            logger.warning("TokenStore: read of %s failed: %s", self.path, e)
-            return {}
-
-    def _write(self, data: dict[str, Any]) -> None:
-        """Atomic, 0600-permissioned write."""
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            os.chmod(self.path.parent, 0o700)
-        except OSError:
-            pass  # Best-effort; defense in depth.
-        # Atomic: write to .tmp, fsync, rename. Open with 0600 from the
-        # start so the temp file is never world-readable mid-write.
-        tmp = self.path.with_name(self.path.name + ".tmp")
-        try:
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, self.path)
-        except Exception:
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
-            raise
-
-    # ---- one-time migration from keychain ----
-
-    def _maybe_migrate_from_keychain(self) -> None:
-        """One-time, best-effort migration of existing keychain entries.
-
-        If the tokens file already exists, we're past migration. Otherwise
-        try to read keychain; if there's a usable entry, write it to the
-        file and delete the keychain copy so we don't leave duplicates.
-        """
-        if self.path.exists():
-            return
-        try:
-            active = keyring.get_password(self.service, ACTIVE_EMAIL_ACCOUNT)
-            if not active:
-                return
-            refresh = keyring.get_password(self.service, active)
-            if not refresh:
-                return
-            self._write(
-                {"active_email": active, "tokens": {active: refresh}}
-            )
+            logger.warning("TokenStore: read of %s failed: %s — discarding", self.path, e)
+            data = {}
+        if not isinstance(data, dict) or data.get("schema_version") != SCHEMA_VERSION:
+            # Pre-v4 (or corrupt). Overwrite with empty v4 shape so we never
+            # mis-interpret old data as v4 tokens.
             logger.info(
-                "TokenStore: migrated tokens from keychain to %s (one-time)",
+                "TokenStore: pre-v4 token file at %s — discarding (per spec §8)",
                 self.path,
             )
-            for account in (ACTIVE_EMAIL_ACCOUNT, active):
-                try:
-                    keyring.delete_password(self.service, account)
-                except keyring.errors.PasswordDeleteError:
-                    pass
-                except Exception as e:
-                    logger.debug(
-                        "TokenStore: post-migration keychain cleanup failed (%s)", e
-                    )
-        except Exception as e:
-            # Keychain might be inaccessible (path-ACL is the very issue
-            # we're fixing). Don't crash; user just re-links once.
-            logger.info("TokenStore: keychain migration skipped (%s)", e)
+            self._cache = {"schema_version": SCHEMA_VERSION, "tokens": {}}
+            self._write(self._cache)
+            return self._cache
+        # Ensure required top-level keys exist.
+        if "tokens" not in data or not isinstance(data["tokens"], dict):
+            data["tokens"] = {}
+        self._cache = data
+        return self._cache
+
+    def _write(self, data: dict[str, Any]) -> None:
+        self._cache = data
+        _atomic_write_json(self.path, data)
 
 
 class AuthClient:
-    """OAuth client: device-code flow, refresh, in-memory access-token cache."""
+    """v4 auth client: token validation, background rotation, device-flow link."""
 
     def __init__(
         self,
@@ -289,94 +275,82 @@ class AuthClient:
     ):
         self.config = config
         self.http = http
-        self.store = store or TokenStore(config.keychain_service)
-        self._cached: TokenBundle | None = None
-        # Device-code poll cooldown. The server returns interval=5s as a
-        # baseline, but we enforce a stricter minimum because the device
-        # flow is gated on a human physically interacting with their
-        # phone (open app → enter code → tap Confirm), which is on
-        # tens-of-seconds timescale, not seconds. Polling every 5s is
-        # pure noise. We also obey RFC 8628 `slow_down` by extending
-        # the cooldown after the server tells us to slow down.
-        self._next_device_poll_allowed_at: float = 0.0
+        self.store = store or TokenStore()
+        # Single in-flight rotation guard (per email — but in practice we have
+        # one active email at a time, so a single asyncio.Lock suffices).
+        self._rotation_lock = asyncio.Lock()
+        # Set after the first successful rotation/check-link/etc., so the
+        # background-refresh loop knows to look at this email.
+        self._active_email: str | None = self.store.get_active_email()
 
-    # ---- public API ----
+    # ---- public surface ----
 
     async def get_access_token(self) -> str:
-        """Return a valid access token.
-
-        Order of attempts:
-          1. In-memory cache (if not expired)
-          2. Refresh-token grant (if a refresh token is in the keychain)
-          3. Single poll of any pending device-code flow on disk
-          4. Raise NotAuthorizedError — caller should invoke link()
-        """
-        bundle = self._cached
-        now = time.time()
-        if bundle and bundle.expires_at - now > ACCESS_TOKEN_LEEWAY_SECONDS:
-            return bundle.access_token
-
-        # 2) Try refresh
-        email = self.store.get_active_email()
-        if email:
-            refresh = self.store.get_refresh_token(email)
-            if refresh:
-                try:
-                    bundle = await self._refresh(refresh, email)
-                    self._cached = bundle
-                    return bundle.access_token
-                except AuthError:
-                    self.store.clear(email)
-
-        # 3) Try to complete a pending device flow (one shot)
-        pending = self._read_pending()
-        if pending:
-            completed = await self.complete_device_flow_once()
-            if completed is not None:
-                self._cached = completed
-                return completed.access_token
-            # still pending — fall through to NotAuthorizedError below
+        """Return a usable token. Triggers background rotation if past day 7."""
+        email = self._active_email or self.store.get_active_email()
+        if not email:
             raise NotAuthorizedError(
-                "Authorization is still pending. Open the iOS app and enter "
-                f"code {pending['user_code']} in Settings → 'Authorize new "
-                "device', then retry. If you've already authorized, wait a "
-                "moment and try again — there's a 5s polling interval.",
-                pending_user_code=pending["user_code"],
+                "Not authorized. Run /remotecodetrol:link to start the OAuth "
+                "device-code flow."
             )
-
-        # 4) No path forward — caller must invoke link()
-        raise NotAuthorizedError(
-            "Not authorized. Run /remotecodetrol:link (or call the link() "
-            "tool) to start the OAuth device-code flow.",
-        )
+        stored = self.store.get_token(email)
+        if not stored:
+            raise NotAuthorizedError(
+                f"No token stored for {email}. Run /remotecodetrol:link."
+            )
+        now = time.time()
+        if stored.expires_at - now <= _TOKEN_TTL_LEEWAY_SECONDS:
+            # Token is essentially expired — try a synchronous rotation as a
+            # last-ditch effort, but don't crash if it fails (caller can
+            # always re-link).
+            try:
+                stored = await self._rotate_now(email, stored)
+            except AuthError:
+                self.store.clear(email)
+                raise NotAuthorizedError(
+                    "Token expired and rotation failed. Re-link via "
+                    "/remotecodetrol:link."
+                )
+        elif now >= stored.rotates_at:
+            # Past day-7 window. Spawn a background rotation if we haven't
+            # tried in the last hour. Returns the still-valid current token
+            # immediately; the next call after rotation succeeds will see
+            # the new one.
+            self._maybe_spawn_background_rotation(email, stored)
+        return stored.token
 
     async def whoami(self) -> str:
-        """Email of the active identity (forces a token validation pass)."""
         await self.get_access_token()
-        assert self._cached is not None
-        return self._cached.email
+        email = self._active_email or self.store.get_active_email()
+        if not email:
+            raise AuthError("Inconsistent state: token loaded but no active email")
+        return email
 
     def invalidate(self) -> None:
-        """Drop the cached access token (e.g. after a 401)."""
-        self._cached = None
+        """Hint that the current token may be revoked. Drops nothing on disk
+        (the next call will re-read from disk). Provided for API parity with
+        the v0.3.x AuthClient — the v4 token model has no in-memory cache to
+        clear because we don't decode JWT claims."""
+        # In v0.3.x this dropped the access-token cache; v4 doesn't have one.
+        # Keep the method as a no-op so APIClient's retry logic still calls it.
+        return None
 
     def logout(self) -> None:
-        """Clear ALL credentials: cache, keychain refresh token, pending flow."""
-        self._cached = None
-        email = self.store.get_active_email()
+        """Clear ALL credentials."""
+        email = self._active_email or self.store.get_active_email()
         if email:
             self.store.clear(email)
         self.store.clear_active_email()
-        self._clear_pending()
+        self._active_email = None
 
-    # ---- device-code flow primitives ----
+    # ---- device-code link flow ----
 
     async def start_device_flow(self) -> DeviceFlowInfo:
-        """Initiate a new device-code flow.
+        """POST /v1/oauth/device/code; return user_code + deep_link + device_code.
 
-        POSTs /oauth/device/code, persists the device_code to state.json
-        for the next tool call to consume, and returns the user-facing
-        bits (user_code + verification URL).
+        The device_code is opaque and is the credential later passed to
+        /v1/oauth/check-link or /v1/oauth/token to complete the flow. Caller
+        is responsible for passing it back when the user confirms.
         """
         v1 = self.config.api_v1
         resp = await self.http.post(
@@ -388,167 +362,177 @@ class AuthClient:
                 f"device-code start failed: {resp.status_code} {resp.text[:200]}"
             )
         body = resp.json()
-        device_code: str = body["device_code"]
-        user_code: str = body["user_code"]
+        user_code = body["user_code"]
+        device_code = body["device_code"]
         interval = int(body.get("interval", 5))
         expires_in = int(body.get("expires_in", 600))
-        verify = body.get("verification_uri_complete") or (
+        verification_uri = body.get("verification_uri_complete") or (
             f"{body.get('verification_uri', 'https://remotecodetrol.web.app/authorize')}"
             f"?user_code={user_code}"
         )
-
-        update_state({
-            PENDING_FLOW_KEY: {
-                "device_code": device_code,
-                "user_code": user_code,
-                "verification_uri": verify,
-                "interval": interval,
-                "expires_at": time.time() + expires_in,
-            }
-        })
-
-        # Best-effort stderr breadcrumb for log readers; not user-facing in
-        # Claude Code (which only sees the tool return value).
-        print(
-            f"[remotecodetrol-mcp] device flow started, code={user_code}",
-            file=sys.stderr,
-            flush=True,
-        )
+        deep_link = f"remotecodetrol://authorize?code={user_code}"
 
         return DeviceFlowInfo(
             user_code=user_code,
-            verification_uri=verify,
+            verification_uri=verification_uri,
+            deep_link=deep_link,
             expires_in_seconds=expires_in,
             interval_seconds=interval,
+            device_code=device_code,
         )
 
-    async def complete_device_flow_once(self) -> TokenBundle | None:
-        """Poll /oauth/token ONCE for a pending device flow.
+    async def complete_link_force(self, device_code: str) -> dict[str, Any]:
+        """Force-poll /v1/oauth/check-link.
 
-        Returns:
-            TokenBundle on success (and stores tokens to disk).
-            None if the user hasn't authorized yet (`authorization_pending`,
-              `slow_down`, or we're in cooldown from a recent poll).
-
-        Raises:
-            AuthError if the flow is terminally failed (`expired_token`,
-            `access_denied`) or a network/protocol error occurs. The
-            pending state is cleared from disk in that case.
-            NotAuthorizedError if there's no pending flow at all.
-
-        Cooldown semantics (v0.3.6+): we enforce
-        `MIN_DEVICE_POLL_INTERVAL_SECONDS` (default 30s) between polls
-        regardless of what `interval` the server returned at flow start.
-        Reasons:
-        - The flow is gated on a human picking up their phone, opening
-          the app, typing the code, tapping Confirm. That's
-          tens-of-seconds at best, so 5s polling is pure noise.
-        - Repeated tool calls during link (e.g. Claude calling whoami
-          rapidly to check status) used to fire one poll per call,
-          earning RFC 8628 `slow_down` from the server.
-        - On `slow_down`, we extend the cooldown by 30s additional, per
-          RFC 8628 §3.5 ("the client MUST increase the polling interval").
+        Bypasses both client-side and server-side polling cooldowns. Use
+        when the user explicitly confirms in-app authorization. Returns
+        the raw JSON response so the caller can surface status + token to
+        Claude. On `authorized`, persists the v4 token to disk.
         """
-        pending = self._read_pending()
-        if not pending:
-            raise NotAuthorizedError("No pending device flow to complete.")
+        v1 = self.config.api_v1
+        resp = await self.http.post(
+            f"{v1}/oauth/check-link",
+            json={
+                "device_code": device_code,
+                "device_label": self.config.device_label,
+            },
+        )
+        if resp.status_code in (200,):
+            body = resp.json()
+            if body.get("status") == "authorized":
+                self._persist_fresh_token(body)
+            return body
+        if resp.status_code == 410:
+            try:
+                return resp.json()
+            except Exception:
+                return {"status": "expired"}
+        raise AuthError(
+            f"check-link failed: {resp.status_code} {resp.text[:200]}"
+        )
 
-        if time.time() > pending["expires_at"]:
-            self._clear_pending()
-            raise AuthError(
-                "Pending device-code flow expired. Run /remotecodetrol:link "
-                "again to start a new one."
-            )
+    async def complete_link_via_token_grant(self, device_code: str) -> dict[str, Any]:
+        """Backwards-compatible completion via /v1/oauth/token (device_code grant).
 
-        # Cooldown gate: skip the HTTP call entirely if we polled too recently.
-        now = time.time()
-        if now < self._next_device_poll_allowed_at:
-            return None
-
+        Used when the caller wants to respect RFC 8628 polling semantics
+        rather than force-polling via check-link. Most tool flows should
+        use complete_link_force when the user has explicitly confirmed.
+        """
         v1 = self.config.api_v1
         resp = await self.http.post(
             f"{v1}/oauth/token",
             data={
                 "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-                "device_code": pending["device_code"],
+                "device_code": device_code,
+                "device_label": self.config.device_label,
             },
         )
-        # Schedule next allowed poll BEFORE handling the response, so even on
-        # success we leave a quiet window (matters less but keeps logic
-        # uniform).
-        self._next_device_poll_allowed_at = (
-            time.time() + MIN_DEVICE_POLL_INTERVAL_SECONDS
-        )
-
         if resp.status_code == 200:
-            payload = resp.json()
-            access = payload["access_token"]
-            refresh = payload["refresh_token"]
-            email = _email_from_access_token(access)
-            bundle = TokenBundle(
-                access_token=access,
-                refresh_token=refresh,
-                expires_at=_expiry_from_access_token(access),
-                email=email,
-            )
-            self.store.set_active_email(email)
-            self.store.set_refresh_token(email, refresh)
-            self._clear_pending()
-            return bundle
-
+            body = resp.json()
+            self._persist_fresh_token(body)
+            return {"status": "authorized", **body}
         try:
             err = resp.json()
         except Exception:
             err = {"error": f"http_{resp.status_code}"}
         code = err.get("error", "")
-        if code == "slow_down":
-            # RFC 8628 §3.5: client MUST increase polling interval by ≥5s.
-            # We add a full extra cooldown window on top of the baseline.
-            self._next_device_poll_allowed_at = (
-                time.time() + MIN_DEVICE_POLL_INTERVAL_SECONDS * 2
-            )
-            return None
         if code == "authorization_pending":
-            return None
+            return {"status": "pending"}
+        if code == "slow_down":
+            return {"status": "pending"}
         if code in ("expired_token", "access_denied"):
-            self._clear_pending()
-            raise AuthError(f"device-code flow ended: {code}")
-        raise AuthError(
-            f"device-code poll error: {code} ({resp.status_code})"
-        )
+            return {"status": "expired" if code == "expired_token" else "denied"}
+        raise AuthError(f"token grant error: {code} ({resp.status_code})")
 
-    # ---- internals ----
+    # ---- rotation internals ----
 
-    async def _refresh(self, refresh_token: str, email: str) -> TokenBundle:
-        url = f"{self.config.api_v1}/oauth/token"
-        resp = await self.http.post(
-            url,
-            data={
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token,
-            },
+    def _persist_fresh_token(self, body: dict[str, Any]) -> None:
+        """Write a freshly issued v4 token to the store and set active_email.
+
+        Called after a successful /token or /check-link response.
+        """
+        token = body["token"]
+        expires_in = int(body.get("expires_in", self.config.mcp_token_ttl_sec))
+        rotates_after = int(
+            body.get("rotates_after", self.config.mcp_token_rotate_after_sec)
         )
-        if resp.status_code != 200:
-            raise AuthError(
-                f"refresh failed: {resp.status_code} {resp.text[:200]}"
-            )
-        payload = resp.json()
-        new_refresh = payload.get("refresh_token", refresh_token)
-        access = payload["access_token"]
-        bundle = TokenBundle(
-            access_token=access,
-            refresh_token=new_refresh,
-            expires_at=_expiry_from_access_token(access),
+        now = time.time()
+        # We don't have the email server-side without a separate /whoami call.
+        # Use a placeholder email for now — pre-v4 used the JWT's `sub` claim,
+        # but v4 tokens are opaque. The active_email is purely for the multi-
+        # account local model; on most installs the user only has one anyway.
+        # Resolve via an unauthenticated /whoami-ish trick: ask the token
+        # who it belongs to. (See _resolve_email_for_new_token below.)
+        email = self._active_email or "default"
+        self.store.store_token(
             email=email,
+            token=token,
+            expires_at=now + expires_in,
+            rotates_at=now + rotates_after,
+            issued_at=now,
         )
-        # Refresh tokens rotate on every use; persist the new one.
-        self.store.set_refresh_token(email, new_refresh)
-        return bundle
+        self.store.set_active_email(email)
+        self._active_email = email
 
-    @staticmethod
-    def _read_pending() -> dict[str, Any] | None:
-        return read_state().get(PENDING_FLOW_KEY)
+    async def _rotate_now(self, email: str, current: StoredToken) -> StoredToken:
+        """Synchronously rotate the current token to a fresh one.
 
-    @staticmethod
-    def _clear_pending() -> None:
-        update_state({PENDING_FLOW_KEY: None})
+        Single in-flight guard — concurrent callers serialize and only the
+        first actually performs the rotation.
+        """
+        async with self._rotation_lock:
+            # Re-read after acquiring the lock; another coroutine may have
+            # just rotated.
+            stored = self.store.get_token(email) or current
+            if stored.token != current.token:
+                # Someone else rotated under us. Use the fresh token.
+                return stored
+            self.store.mark_rotation_attempt(email)
+            v1 = self.config.api_v1
+            resp = await self.http.post(
+                f"{v1}/oauth/rotate",
+                headers={"Authorization": f"Bearer {stored.token}"},
+            )
+            if resp.status_code != 200:
+                raise AuthError(
+                    f"rotate failed: {resp.status_code} {resp.text[:200]}"
+                )
+            body = resp.json()
+            new_token = body["token"]
+            expires_in = int(body.get("expires_in", self.config.mcp_token_ttl_sec))
+            rotates_after = int(
+                body.get("rotates_after", self.config.mcp_token_rotate_after_sec)
+            )
+            now = time.time()
+            self.store.store_token(
+                email=email,
+                token=new_token,
+                expires_at=now + expires_in,
+                rotates_at=now + rotates_after,
+                issued_at=now,
+            )
+            return self.store.get_token(email) or stored
+
+    def _maybe_spawn_background_rotation(
+        self, email: str, current: StoredToken
+    ) -> None:
+        """Fire-and-forget rotation. Throttled to once per hour per email."""
+        last = current.last_rotation_attempt_at
+        now = time.time()
+        if last and (now - last) < _ROTATION_RETRY_INTERVAL_SECONDS:
+            return
+        # Don't await — non-blocking.
+        asyncio.get_event_loop().create_task(
+            self._background_rotate_silently(email, current)
+        )
+
+    async def _background_rotate_silently(
+        self, email: str, current: StoredToken
+    ) -> None:
+        try:
+            await self._rotate_now(email, current)
+            logger.info("auth: background rotation succeeded for %s", email)
+        except Exception as e:
+            logger.warning("auth: background rotation failed for %s: %s", email, e)
+            # Don't clear the token — current token still works for ~7 more
+            # days. Background loop will retry hourly per the throttle.

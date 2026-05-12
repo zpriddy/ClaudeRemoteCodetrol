@@ -1,5 +1,109 @@
 # Changelog
 
+## v0.4.0 — Transport rewrite (auth + CLI + thread scoping + QR)
+
+Spec 1 of the v4 trilogy. Replaces the OAuth access+refresh JWT pair
+with a single 14-day opaque token, adds a `rcct` Bash CLI talking to
+the MCP over a Unix domain socket, enforces per-session thread
+isolation via a `known_threads` allowlist, and renders an ASCII QR in
+the link flow. Spec doc:
+`docs/superpowers/specs/2026-05-11-v4-transport-design.md`.
+
+**Breaking:** no migration from v0.3.x. Existing links are abandoned;
+v4 detects the old `tokens.json` schema (no `schema_version` key, or
+`< 4`), discards it, and the next tool call surfaces a clean re-link
+prompt. Users re-link via `/remotecodetrol:link`. Documented in the
+spec as a deliberate scope cut — the migration complexity isn't worth
+it for the user base size.
+
+### Auth — single 14-day opaque token
+
+- 32-byte URL-safe random, hashed (`SHA-256`) for the Firestore doc id;
+  plaintext returned exactly once at issuance. Same hash-as-id pattern
+  as the old `oauth_refresh_tokens` collection.
+- 14-day TTL, day-7 background rotation trigger, hourly retry over the
+  remaining 7 days if rotation fails. Non-blocking — the old token
+  stays valid while rotation retries.
+- **60s rotation grace window** solves the "client never received the
+  rotation response" race: when a token is replaced, the old doc gets
+  `supersededBy = newHash` and `graceUntil = now + 60s`. Validation
+  accepts it during the grace; client retries with the old token,
+  receives the new plaintext a second time, learns the new value.
+- **New endpoints:** `POST /v1/oauth/rotate` (overlap rotation),
+  `POST /v1/oauth/check-link` (force-poll, bypasses RFC 8628
+  cooldowns).
+- **Removed endpoints:** `/v1/oauth/jwks`. The `refresh_token` grant
+  type on `/v1/oauth/token` is dropped entirely — v4 uses `/rotate`.
+- **Auth middleware** rewritten: JWT verification removed; v4 validates
+  opaque tokens against `mcp_tokens/<hash>` with a 60s LRU cache (~500
+  entries per instance). Steady-state expected ≥ 95% hit rate; cache
+  hit is pure RAM, no Firestore read.
+- **`tokens.json` schema:** new `schema_version: 4` shape with a single
+  `token` field per email; old shape is detected and discarded.
+- **Daily sweeper:** new `sweepMcpTokensCron` Cloud Function (Cloud
+  Scheduler → Pub/Sub) deletes `mcp_tokens` docs where
+  `expiresAt < now - 1d` OR (`supersededBy != null AND graceUntil < now - 1d`).
+
+### CLI — `rcct` over Unix domain socket
+
+- New `rcct` Bash entry point (`bin/rcct` shell wrapper around `uvx
+  --from ... rcct`). Subcommands: `send`, `check`, `wait`, `ack`,
+  `whoami`, `link`, `check-link`, `logout`, `threads {list, allow,
+  forget, known}`. All accept `--json` for machine-readable output.
+- **IPC:** line-delimited JSON over Unix domain socket at
+  `~/Library/Caches/remotecodetrol/mcp.sock` (macOS) /
+  `${XDG_RUNTIME_DIR}/remotecodetrol/mcp.sock` (linux), permission
+  `0600`. Single-request-per-connection. Stale-socket recovery via
+  connect-probe at startup.
+- **Single implementation, two surfaces:** the same Python functions
+  registered as `@mcp.tool` are dispatched from the socket handler.
+  No duplication; `tokens.json`, the SSE cache, and `known_threads`
+  are all shared because there's only one MCP process.
+- **No auto-spawn.** If the socket isn't responding, `rcct` exits 2
+  with a hint to start a Claude session with the plugin. Single-writer-
+  on-`tokens.json` invariant > convenience of standalone CLI.
+- **PATH install:** a `SessionStart` hook symlinks `~/.local/bin/rcct`
+  → `${CLAUDE_PLUGIN_ROOT}/bin/rcct` on every session start
+  (idempotent; auto-points at the latest plugin version after upgrade).
+  Stderr warning if `~/.local/bin` isn't on PATH.
+
+### `known_threads` — per-session thread allowlist
+
+- New `set[str]` on `StreamingState`, in-memory only, per MCP process.
+  Re-derived from env + runtime declarations on every launch (no
+  persistence; aligns with session-scoped philosophy).
+- **Auto-populated** by `set_thread(name)` and `send_message(thread=...)`
+  — sending IS declaring intent. Pre-seedable via the
+  `REMOTECODETROL_KNOWN_THREADS=foo,bar` env var.
+- **`forget_thread(name)`** / `rcct threads forget <name>` removes a
+  thread, clears active if it matched, and prunes the cache.
+- **SSE consumer drops events** for threads not in the set (snapshot
+  replay filtered the same way). Cross-session leakage is now
+  structural, not honor-system: Claude session A literally cannot see
+  threads it hasn't declared, even when session B sends on them.
+- **`peek_messages` / `ack_messages` reject** unknown threads.
+  `peek_messages(thread="*")` returns pending across known threads
+  only. `list_threads()` still returns ALL backend threads
+  (discoverability) — each `ThreadSummary` gains a `known: bool`.
+
+### Link flow — ASCII QR + `complete_link()`
+
+- `link()` / `rcct link` now render an ASCII QR (`qrcode` lib,
+  error-correction `M`, `invert=True` for dark terminals) encoding
+  `remotecodetrol://authorize?code=<USER_CODE>`. The iOS app's in-app
+  scanner extracts the code; iPhone Camera will deep-link once Spec 2
+  ships URL-scheme registration.
+- `LinkResult` gains `qr_ascii`, `deep_link`, and `expires_in_seconds`.
+  The `user_code` remains as manual fallback. SKILL teaches Claude
+  to lead with the QR and offer the code as backup.
+- **New `complete_link()` tool** / `rcct check-link` for the "user
+  just confirmed" case. Hits `/v1/oauth/check-link` directly,
+  bypassing both client-side cooldown gates (added in v0.3.6) and
+  server-side RFC 8628 `slow_down` enforcement. Returns
+  `authorized | pending | expired | denied | invalid`. Use only when
+  the user explicitly says "I tapped Confirm"; otherwise the SKILL
+  rule is "wait at least 30 seconds before any status check."
+
 ## v0.3.x — Streaming relay redesign
 
 The v0.3.x lineage replaces v0.2.x's polling architecture (5-minute

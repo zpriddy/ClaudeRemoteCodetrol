@@ -1,6 +1,6 @@
 [project]
 name = "remotecodetrol-mcp"
-version = "0.3.13"
+version = "0.4.0"
 description = "MCP server for the RemoteCodetrol iOS notification/remote-control system."
 readme = "README.md"
 license = { text = "MIT" }
@@ -20,9 +20,8 @@ classifiers = [
 dependencies = [
     "fastmcp>=0.2.0",
     "httpx>=0.27.0",
-    "keyring>=24.0.0",
-    "pyjwt>=2.8.0",
     "pydantic>=2.7.0",
+    "qrcode>=7.4",
 ]
 
 [project.optional-dependencies]
@@ -34,6 +33,7 @@ dev = [
 
 [project.scripts]
 remotecodetrol-mcp = "remotecodetrol_mcp.server:main"
+rcct = "remotecodetrol_mcp.cli:main"
 
 [build-system]
 requires = ["hatchling"]

@@ -1,5 +1,5 @@
 {
-  "description": "Inject pending RemoteCodetrol replies as additionalContext on every prompt.",
+  "description": "Hooks for the RemoteCodetrol plugin: inject pending replies as additionalContext, and install the rcct CLI symlink on session start.",
   "hooks": {
     "UserPromptSubmit": [
       {
@@ -7,6 +7,16 @@
           {
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/user-prompt-submit.py\""
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/install-rcct.sh\""
           }
         ]
       }

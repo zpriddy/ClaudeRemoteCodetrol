@@ -87,9 +87,11 @@ def config() -> Config:
         stream_url="https://stream.test.invalid",
         default_thread=None,
         device_label="test-device",
-        keychain_service="com.remotecodetrol.test",
         default_poll_interval_seconds=1,
         default_timeout_minutes=1,
+        mcp_token_ttl_sec=14 * 24 * 60 * 60,
+        mcp_token_rotate_after_sec=7 * 24 * 60 * 60,
+        known_threads_seed=(),
     )
 
 

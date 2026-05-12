@@ -12,9 +12,10 @@ from dataclasses import dataclass
 
 
 DEFAULT_API_BASE = "https://us-central1-remotecodetrol.cloudfunctions.net/api"
-DEFAULT_KEYCHAIN_SERVICE = "com.remotecodetrol.mcp"
 DEFAULT_POLL_INTERVAL_SECONDS = 300
 DEFAULT_TIMEOUT_MINUTES = 10
+DEFAULT_MCP_TOKEN_TTL_SEC = 14 * 24 * 60 * 60
+DEFAULT_MCP_TOKEN_ROTATE_AFTER_SEC = 7 * 24 * 60 * 60
 
 
 @dataclass(frozen=True)
@@ -23,9 +24,11 @@ class Config:
     stream_url: str
     default_thread: str | None
     device_label: str
-    keychain_service: str
     default_poll_interval_seconds: int
     default_timeout_minutes: int
+    mcp_token_ttl_sec: int
+    mcp_token_rotate_after_sec: int
+    known_threads_seed: tuple[str, ...]
 
     @property
     def api_v1(self) -> str:
@@ -63,6 +66,13 @@ def _default_device_label() -> str:
     return f"Claude Code on {host}"
 
 
+def _parse_known_threads_seed(raw: str | None) -> tuple[str, ...]:
+    """Parse REMOTECODETROL_KNOWN_THREADS=foo,bar into a tuple."""
+    if not raw:
+        return ()
+    return tuple(t.strip() for t in raw.split(",") if t.strip())
+
+
 def load_config() -> Config:
     """Build a Config from environment variables (with defaults)."""
     api_base = os.environ.get("REMOTECODETROL_API_BASE", DEFAULT_API_BASE)
@@ -76,9 +86,6 @@ def load_config() -> Config:
         device_label=os.environ.get(
             "REMOTECODETROL_DEVICE_LABEL", _default_device_label()
         ),
-        keychain_service=os.environ.get(
-            "REMOTECODETROL_KEYCHAIN_SERVICE", DEFAULT_KEYCHAIN_SERVICE
-        ),
         default_poll_interval_seconds=int(
             os.environ.get(
                 "REMOTECODETROL_DEFAULT_POLL_INTERVAL_SECONDS",
@@ -90,5 +97,20 @@ def load_config() -> Config:
                 "REMOTECODETROL_DEFAULT_TIMEOUT_MINUTES",
                 str(DEFAULT_TIMEOUT_MINUTES),
             )
+        ),
+        mcp_token_ttl_sec=int(
+            os.environ.get(
+                "REMOTECODETROL_MCP_TOKEN_TTL_SEC",
+                str(DEFAULT_MCP_TOKEN_TTL_SEC),
+            )
+        ),
+        mcp_token_rotate_after_sec=int(
+            os.environ.get(
+                "REMOTECODETROL_MCP_TOKEN_ROTATE_AFTER_SEC",
+                str(DEFAULT_MCP_TOKEN_ROTATE_AFTER_SEC),
+            )
+        ),
+        known_threads_seed=_parse_known_threads_seed(
+            os.environ.get("REMOTECODETROL_KNOWN_THREADS")
         ),
     )

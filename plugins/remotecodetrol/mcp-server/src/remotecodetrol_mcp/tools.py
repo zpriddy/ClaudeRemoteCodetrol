@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 from . import __version__ as PLUGIN_VERSION
 from .client import APIClient, APIError
 from .config import Config
+from .qr import render_qr_ascii
 from .state import read_state, update_state
 from .streaming import StreamingState
 
@@ -99,6 +100,10 @@ class AckResult(BaseModel):
 class ThreadSummary(BaseModel):
     name: str
     last_message_at: str | None = Field(default=None, alias="lastMessageAt")
+    # v0.4.0: indicates whether this thread is in the per-session known_threads
+    # allowlist. False threads are visible (so the user can discover them) but
+    # send/peek/ack against them will error with "not in known_threads".
+    known: bool = False
 
     model_config = {"populate_by_name": True}
 
@@ -109,19 +114,49 @@ class WhoamiResult(BaseModel):
     sse_status: str
     plugin_version: str
     pending_count_by_thread: dict[str, int] = Field(default_factory=dict)
+    # v0.4.0: per-session allowlist (sorted) — useful for debugging "why
+    # can't I see thread X" surprises.
+    known_threads: list[str] = Field(default_factory=list)
 
 
 class LinkResult(BaseModel):
-    """Returned from link(). The user_code + verification_uri are what
-    Claude should display to the user. After they authorize, calling any
-    other tool (whoami, send_message, …) will pick up the new tokens."""
+    """Returned from link(). Show both `user_code` and `qr_ascii` to the user.
+
+    Scan with the iOS app's "Authorize new device" → in-app scanner; the
+    QR encodes `remotecodetrol://authorize?code=<user_code>` which the
+    scanner extracts and submits. The plain `user_code` is the manual
+    fallback if scanning isn't convenient.
+    """
 
     status: str  # "pending_authorization" | "already_linked"
     user_code: str | None = None
     verification_uri: str | None = None
+    deep_link: str | None = None
+    qr_ascii: str | None = None
     expires_in_seconds: int | None = None
     instructions: str
     email: str | None = None  # set when status == "already_linked"
+
+
+class CompleteLinkResult(BaseModel):
+    """Returned from complete_link(). Force-polls /v1/oauth/check-link.
+
+    Use only when the user has explicitly confirmed in-app authorization.
+    Bypasses RFC 8628 polling cooldowns.
+    """
+
+    status: str  # "authorized" | "pending" | "expired" | "denied" | "invalid"
+    email: str | None = None  # set when status == "authorized"
+    message: str
+
+
+class ForgetThreadResult(BaseModel):
+    name: str
+    was_known: bool
+
+
+class ListKnownThreadsResult(BaseModel):
+    threads: list[str]
 
 
 class LogoutResult(BaseModel):
@@ -140,6 +175,32 @@ def _resolve_thread(state: ThreadState, override: str | None) -> str:
             "REMOTECODETROL_THREAD. Use list_threads to see what's available."
         )
     return tid
+
+
+def _ensure_known_thread(
+    streaming: StreamingState | None, tid: str, *, auto_add: bool
+) -> None:
+    """Enforce the v0.4.0 known_threads allowlist.
+
+    `auto_add=True` is the "declaring intent" path (set_thread, send_message):
+    if the thread isn't yet known, add it. `auto_add=False` is the read path
+    (peek_messages, ack_messages): unknown threads raise.
+
+    No-op if `streaming` is None (test/standalone mode without SSE).
+    """
+    if streaming is None:
+        return
+    if streaming.is_thread_known(tid):
+        return
+    if auto_add:
+        streaming.add_known_thread(tid)
+        return
+    raise ValueError(
+        f"Thread '{tid}' is not in this session's known_threads. Call "
+        f"set_thread('{tid}') or `rcct threads allow {tid}` first to "
+        "declare intent. (Reading or acking on an undeclared thread is "
+        "blocked to prevent cross-session leakage; see SKILL §known_threads.)"
+    )
 
 
 def _normalize_send_response(data: dict[str, Any] | None) -> dict[str, Any]:
@@ -193,12 +254,24 @@ def register_tools(
     state: ThreadState,
     config: Config,
     streaming: StreamingState | None = None,
-) -> None:
+) -> dict[str, Any]:
     """Bind all @mcp.tool functions onto the given FastMCP instance.
+
+    Also returns a `dispatchers` dict mapping tool name → async callable
+    that takes the args dict and returns the tool's result. This is what
+    socket_server.py uses for the CLI surface (single implementation,
+    two surfaces — see spec §4.4).
 
     `streaming` is optional — when None (or when the SSE consumer is
     `disabled` / `auth_failed`), tools fall back to direct API calls only.
     """
+    dispatchers: dict[str, Any] = {}
+
+    def _expose(name: str, fn: Any) -> None:
+        """Wrap fn with **args expansion for the socket-style dispatcher."""
+        async def _wrapper(args: dict[str, Any]) -> Any:
+            return await fn(**args)
+        dispatchers[name] = _wrapper
 
     # Internal sentinel — when no streaming state is provided, behave as
     # if the cache is permanently stale so every read goes to the API.
@@ -257,14 +330,16 @@ def register_tools(
 
     @mcp.tool
     async def set_thread(name: str) -> SetThreadResult:
-        """Set the active thread for subsequent send_message / peek / ack calls.
+        """Set the active thread; also adds it to known_threads (v0.4.0+).
 
-        The value is persisted to ~/.config/remotecodetrol/state.json so it
-        survives MCP restarts.
+        The active-thread value is persisted to state.json so it survives
+        MCP restarts. The known_threads allowlist is in-memory only and
+        re-derived on each MCP launch.
         """
         state.set(name)
         if streaming is not None:
             streaming.active_thread = name
+            streaming.add_known_thread(name)
         return SetThreadResult(active_thread=name)
 
     @mcp.tool
@@ -303,6 +378,8 @@ def register_tools(
         `wait=True` blocked.
         """
         tid = _resolve_thread(state, thread)
+        # v0.4.0: sending IS declaring intent — auto-add to known_threads.
+        _ensure_known_thread(streaming, tid, auto_add=True)
         payload: dict[str, Any] = {"body": body, "requireResponse": require_response}
         if idempotency_key:
             payload["idempotencyKey"] = idempotency_key
@@ -349,6 +426,8 @@ def register_tools(
         """
         # All-threads peek: cache-only. Server has no endpoint for this,
         # and the SSE snapshot already covers every thread the user owns.
+        # v0.4.0: cache is already filtered by known_threads, so this is
+        # automatically scoped to known threads only.
         if thread == "*":
             if streaming is None:
                 return PeekResult(messages=[], cursor=None, source="cache")
@@ -356,6 +435,9 @@ def register_tools(
             return PeekResult(messages=msgs, cursor=None, source="cache")
 
         tid = _resolve_thread(state, thread)
+        # v0.4.0: peeking on an undeclared thread is the cross-session leak
+        # we're preventing — reject rather than auto-add.
+        _ensure_known_thread(streaming, tid, auto_add=False)
 
         if _cache_fresh() and streaming is not None:
             cached = streaming.pending.get(tid, [])
@@ -383,6 +465,9 @@ def register_tools(
         round-trips back.
         """
         tid = _resolve_thread(state, thread)
+        # v0.4.0: ack on undeclared thread is also a leak vector (you'd be
+        # silencing a message you weren't supposed to see). Reject.
+        _ensure_known_thread(streaming, tid, auto_add=False)
         await api.post(f"/threads/{tid}/ack", json={"messageIds": message_ids})
         # APIClient raises APIError on non-2xx, so reaching here means HTTP
         # 2xx and we're safe to prune locally.
@@ -399,10 +484,48 @@ def register_tools(
 
     @mcp.tool
     async def list_threads() -> list[ThreadSummary]:
-        """List the user's threads with last-activity timestamps."""
+        """List ALL the user's threads with last-activity timestamps.
+
+        v0.4.0+: each entry includes a `known: bool` indicating whether this
+        thread is in the per-session known_threads allowlist. Listing is
+        UNFILTERED so Claude can discover thread names; sending or peeking
+        on an unknown one then triggers the allowlist check.
+        """
         data = await api.get("/threads")
         items = data.get("threads", data) if isinstance(data, dict) else data
-        return [ThreadSummary.model_validate(it) for it in (items or [])]
+        out: list[ThreadSummary] = []
+        for it in items or []:
+            summary = ThreadSummary.model_validate(it)
+            if streaming is not None and streaming.is_thread_known(summary.name):
+                summary = summary.model_copy(update={"known": True})
+            out.append(summary)
+        return out
+
+    @mcp.tool
+    async def forget_thread(name: str) -> ForgetThreadResult:
+        """Drop `name` from this session's known_threads allowlist (v0.4.0+).
+
+        Subsequent peek_messages/ack_messages on this thread will reject
+        until set_thread/send_message re-declares intent. Cached pending for
+        this thread is dropped from memory.
+
+        If `name` was the active thread, active_thread is cleared.
+        """
+        if streaming is None:
+            return ForgetThreadResult(name=name, was_known=False)
+        was = streaming.forget_known_thread(name)
+        # If active thread was this one, also clear from state.json so a
+        # fresh MCP launch doesn't auto-set it again.
+        if was and state.get() == name:
+            update_state({"active_thread": None})
+        return ForgetThreadResult(name=name, was_known=was)
+
+    @mcp.tool
+    async def list_known_threads() -> ListKnownThreadsResult:
+        """Return the in-memory known_threads allowlist (v0.4.0+)."""
+        if streaming is None:
+            return ListKnownThreadsResult(threads=[])
+        return ListKnownThreadsResult(threads=streaming.list_known())
 
     @mcp.tool
     async def wait_for_response(
@@ -435,7 +558,7 @@ def register_tools(
 
     @mcp.tool
     async def whoami() -> WhoamiResult:
-        """Return identity + streaming status (debug helper).
+        """Return identity + streaming status + known_threads (debug helper).
 
         If not yet authorized, this raises an error instructing the caller
         to run `/remotecodetrol:link` first.
@@ -449,16 +572,23 @@ def register_tools(
             pending_count_by_thread=(
                 streaming.pending_count_by_thread() if streaming else {}
             ),
+            known_threads=streaming.list_known() if streaming else [],
         )
 
     @mcp.tool
     async def link() -> LinkResult:
-        """Start (or restart) the OAuth device-code authorization flow.
+        """Start (or restart) the OAuth device-code authorization flow (v0.4.0+).
 
-        Returns a `user_code` and `verification_uri` to show the user.
-        They authorize in the iOS app (Settings → 'Authorize new device'),
-        and the next call to any tool will detect completed authorization
-        and proceed normally.
+        Returns a `user_code`, a deep-link URL, AND an ASCII QR code
+        encoding `remotecodetrol://authorize?code=<user_code>`. Show BOTH
+        the QR (for scanning in the iOS app's "Authorize new device"
+        scanner) AND the user_code (manual fallback).
+
+        After showing them, **wait at least 30 seconds** before calling
+        whoami() or any other tool to check completion — the flow is
+        human-gated. If the user explicitly says "I confirmed", call
+        complete_link() instead — it bypasses cooldowns for an immediate
+        answer.
         """
         try:
             email = await api.auth.whoami()
@@ -474,27 +604,98 @@ def register_tools(
             pass
 
         info = await api.auth.start_device_flow()
+        # Persist the device_code so a follow-up complete_link() call (or
+        # next auto-completion attempt) can find it without restarting the
+        # flow. State key is namespaced to v4 so it doesn't collide with
+        # any pre-existing v0.3.x keys.
+        update_state({"v4_pending_device_code": info.device_code})
+
+        try:
+            qr_ascii = render_qr_ascii(info.deep_link)
+        except Exception:
+            # qrcode dep missing or render fails — degrade gracefully to
+            # text-only display.
+            qr_ascii = None
+
         return LinkResult(
             status="pending_authorization",
             user_code=info.user_code,
             verification_uri=info.verification_uri,
+            deep_link=info.deep_link,
+            qr_ascii=qr_ascii,
             expires_in_seconds=info.expires_in_seconds,
             instructions=(
                 f"Open the RemoteCodetrol iOS app → Settings → "
-                f"'Authorize new device' → enter code {info.user_code} → "
-                "tap Confirm. Then run `whoami()` (or any other tool) to "
-                "verify the link succeeded."
+                f"'Authorize new device'. Either scan the QR with the "
+                f"in-app scanner, or enter code `{info.user_code}` "
+                f"manually. Wait ≥30s before checking completion; if "
+                f"the user explicitly confirms, call `complete_link()` "
+                f"for an immediate answer."
+            ),
+        )
+
+    @mcp.tool
+    async def complete_link() -> CompleteLinkResult:
+        """Force-poll /v1/oauth/check-link to verify pending authorization.
+
+        Use ONLY when the user explicitly confirms they tapped Confirm
+        in the iOS app. Bypasses RFC 8628 polling cooldowns for an
+        immediate answer. If you're just curious or impatient, end the
+        turn instead — the user's next prompt will trigger natural
+        completion.
+
+        Reads the device_code from state.json (set by the prior link()
+        call). If no pending flow exists, returns `status="invalid"`
+        with a hint to call link() first.
+        """
+        device_code = read_state().get("v4_pending_device_code")
+        if not device_code:
+            return CompleteLinkResult(
+                status="invalid",
+                message=(
+                    "No pending device-code flow. Run `link()` first to "
+                    "start one."
+                ),
+            )
+        result = await api.auth.complete_link_force(device_code)
+        status = result.get("status", "invalid")
+        if status == "authorized":
+            update_state({"v4_pending_device_code": None})
+            email = await api.auth.whoami()
+            return CompleteLinkResult(
+                status="authorized",
+                email=email,
+                message=f"Linked as {email}. Ready to use.",
+            )
+        if status == "pending":
+            return CompleteLinkResult(
+                status="pending",
+                message=(
+                    "Still pending — user has not confirmed in the iOS "
+                    "app yet. Wait for the user to tap Confirm; do NOT "
+                    "loop on this tool."
+                ),
+            )
+        # expired / denied / invalid
+        update_state({"v4_pending_device_code": None})
+        return CompleteLinkResult(
+            status=status,
+            message=(
+                f"Device-code flow ended: {status}. Run `link()` to "
+                "start a fresh one."
             ),
         )
 
     @mcp.tool
     async def logout() -> LogoutResult:
-        """Clear all stored credentials.
+        """Clear all stored credentials (v0.4.0+).
 
-        Removes the cached access token, deletes the refresh token from
-        the macOS Keychain, and clears any pending device-code flow.
+        Removes the v4 token from `~/Library/Application Support/
+        RemoteCodetrol/tokens.json` and clears active_email / pending
+        device-code state.
         """
         api.auth.logout()
+        update_state({"v4_pending_device_code": None})
         return LogoutResult(
             status="logged_out",
             message=(
@@ -502,3 +703,21 @@ def register_tools(
                 "authorize again."
             ),
         )
+
+    # Expose every tool to the CLI socket dispatcher (v0.4.0+). Single
+    # implementation, two surfaces: stdio MCP via @mcp.tool above, and
+    # rcct CLI via this dispatch map.
+    _expose("set_thread", set_thread)
+    _expose("send_message", send_message)
+    _expose("peek_messages", peek_messages)
+    _expose("ack_messages", ack_messages)
+    _expose("list_threads", list_threads)
+    _expose("forget_thread", forget_thread)
+    _expose("list_known_threads", list_known_threads)
+    _expose("wait_for_response", wait_for_response)
+    _expose("whoami", whoami)
+    _expose("link", link)
+    _expose("complete_link", complete_link)
+    _expose("logout", logout)
+
+    return dispatchers

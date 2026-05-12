@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# rcct — wrapper that runs the Python CLI through uvx so we don't need to
+# duplicate the package install. The MCP server already lives at
+# ${CLAUDE_PLUGIN_ROOT}/mcp-server (declared in .mcp.json); we just route
+# the `rcct` console-script entry point through the same uvx invocation.
+#
+# Cold-start cost: ~50ms after uvx caches the resolution (first run is
+# slower). For Claude's typical use case (many CLI calls per session),
+# this is fine.
+
+set -e
+
+# ${CLAUDE_PLUGIN_ROOT} is set by Claude Code when the plugin is loaded.
+# When running outside Claude Code (e.g. manual debug), fall back to the
+# script's parent directory.
+if [[ -z "${CLAUDE_PLUGIN_ROOT:-}" ]]; then
+  CLAUDE_PLUGIN_ROOT="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." && pwd )"
+fi
+
+exec uvx --quiet --from "${CLAUDE_PLUGIN_ROOT}/mcp-server" rcct "$@"
