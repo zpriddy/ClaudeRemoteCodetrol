@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.4.5 — Spec 2 wire fields restored (replied_to, mcp_acked_at, claude_acked_at)
+
+Found by exercising iOS v1.2.0's reply feature: the user tapped Reply,
+the iOS code wrote `repliedTo` to Firestore correctly, the backend
+relayed it on the wire as `replied_to` — but Claude's `peek_messages`
+output never included it.
+
+Root cause: the MCP's Pydantic `Message` model was authored before
+Spec 2 and didn't declare any of the new fields. Combined with
+`extra: "ignore"`, validation silently dropped them. Same pattern
+would also have eaten `mcp_acked_at` and `claude_acked_at` (the
+tri-state read-receipt fields) — so the fix adds all three.
+
+Files:
+- `tools.py::Message` — added `replied_to`, `mcp_acked_at`,
+  `claude_acked_at` fields.
+- `streaming.py::_normalize_message` — added camelCase fallbacks
+  for the same three (`repliedTo`/`mcpAckedAt`/`claudeAckedAt` →
+  snake), defense-in-depth in case the SSE wire ever emits the
+  iOS-side casing directly.
+
+The bug class is "data was correct on the wire, schema dropped it
+during validation." Worth a code-review pattern: any time you add a
+field to the Firestore schema or wire format, grep `extra: "ignore"`
+and update every consumer model.
+
 ## v0.4.4 — Boot-time grandfather of `active_thread` into `known_threads`
 
 Two fixes from a post-restart `whoami` test:

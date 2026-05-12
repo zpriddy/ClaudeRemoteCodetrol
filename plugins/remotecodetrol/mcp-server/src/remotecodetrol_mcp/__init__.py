@@ -13,4 +13,4 @@ long-lived SSE connection to the backend feeds an in-memory cache and a
 `UserPromptSubmit` hook that surfaces pending replies between turns.
 """
 
-__version__ = "0.4.4"
+__version__ = "0.4.5"

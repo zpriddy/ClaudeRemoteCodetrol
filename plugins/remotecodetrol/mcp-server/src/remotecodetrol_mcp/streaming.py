@@ -719,6 +719,13 @@ def _normalize_message(payload: dict[str, Any]) -> dict[str, Any]:
         out["require_response"] = out["requireResponse"]
     if "idempotency_key" not in out and "idempotencyKey" in out:
         out["idempotency_key"] = out["idempotencyKey"]
+    # Spec 2 (v1.2.0+): reply-context + tri-state read-receipt fields.
+    if "replied_to" not in out and "repliedTo" in out:
+        out["replied_to"] = out["repliedTo"]
+    if "mcp_acked_at" not in out and "mcpAckedAt" in out:
+        out["mcp_acked_at"] = out["mcpAckedAt"]
+    if "claude_acked_at" not in out and "claudeAckedAt" in out:
+        out["claude_acked_at"] = out["claudeAckedAt"]
     return out
 
 

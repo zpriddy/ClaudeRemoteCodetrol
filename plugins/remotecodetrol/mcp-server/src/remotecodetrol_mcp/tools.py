@@ -74,6 +74,13 @@ class Message(BaseModel):
     idempotency_key: str | None = Field(default=None, alias="idempotency_key")
     acked_at: str | None = Field(default=None, alias="acked_at")
     body_truncated: bool | None = Field(default=None, alias="body_truncated")
+    # Spec 2 (iOS app v1.2.0+): reply-context + tri-state read receipts.
+    # Without these declarations, `extra: "ignore"` silently dropped them
+    # during validation — the wire data was correct, but Claude's view
+    # never showed `replied_to` even when the iOS user tapped Reply.
+    replied_to: str | None = Field(default=None, alias="replied_to")
+    mcp_acked_at: str | None = Field(default=None, alias="mcp_acked_at")
+    claude_acked_at: str | None = Field(default=None, alias="claude_acked_at")
 
     model_config = {"populate_by_name": True, "extra": "ignore"}
 
