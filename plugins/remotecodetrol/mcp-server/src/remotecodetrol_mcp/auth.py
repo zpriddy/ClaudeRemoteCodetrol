@@ -450,6 +450,11 @@ class AuthClient:
         """Write a freshly issued v4 token to the store and set active_email.
 
         Called after a successful /token or /check-link response.
+
+        v0.4.3+: backend now returns `email` in the response body (looked up
+        from `users/{uid}.email` on the backend). We use it when present and
+        fall back to the existing active_email or "default" for compatibility
+        with backends that don't yet return it.
         """
         token = body["token"]
         expires_in = int(body.get("expires_in", self.config.mcp_token_ttl_sec))
@@ -457,13 +462,17 @@ class AuthClient:
             body.get("rotates_after", self.config.mcp_token_rotate_after_sec)
         )
         now = time.time()
-        # We don't have the email server-side without a separate /whoami call.
-        # Use a placeholder email for now — pre-v4 used the JWT's `sub` claim,
-        # but v4 tokens are opaque. The active_email is purely for the multi-
-        # account local model; on most installs the user only has one anyway.
-        # Resolve via an unauthenticated /whoami-ish trick: ask the token
-        # who it belongs to. (See _resolve_email_for_new_token below.)
-        email = self._active_email or "default"
+        # Prefer the email the backend returned; fall back to the previously-
+        # active email; final fallback "default" matches v0.4.0–0.4.2 behavior.
+        email = body.get("email") or self._active_email or "default"
+
+        # If the email changed (e.g. previously stored under "default" and the
+        # backend now told us the real one), drop the old token entry so we
+        # don't leak a stale "default" record alongside the real one.
+        prior_email = self._active_email or self.store.get_active_email()
+        if prior_email and prior_email != email:
+            self.store.clear(prior_email)
+
         self.store.store_token(
             email=email,
             token=token,

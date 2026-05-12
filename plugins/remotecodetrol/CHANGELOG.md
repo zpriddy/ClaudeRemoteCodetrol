@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.4.3 — Real email in `whoami` (no more `default`)
+
+Backend now returns `email` in the `/v1/oauth/token` and
+`/v1/oauth/check-link` responses. The MCP stores it as
+`active_email`, so `whoami` and `tokens.json` show your actual
+address (e.g., `me@zpriddy.com`) instead of the placeholder
+`default` that v0.4.0–0.4.2 used because opaque tokens carry no
+JWT claims.
+
+Backwards-compatible: backends that don't yet return `email` cause
+the MCP to fall back to the existing active_email or `default` —
+same behavior as v0.4.2.
+
+The MCP also cleans up the stale `default` entry in `tokens.json`
+on the first link/rotate against a v0.4.3+ backend, so you don't
+end up with both `default` and `me@zpriddy.com` records.
+
 ## v0.4.2 — `rcct` wrapper symlink-resolution fix
 
 The `bin/rcct` Bash wrapper used `BASH_SOURCE[0]` to derive
