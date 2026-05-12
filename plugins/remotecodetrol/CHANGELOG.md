@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.4.2 — `rcct` wrapper symlink-resolution fix
+
+The `bin/rcct` Bash wrapper used `BASH_SOURCE[0]` to derive
+`${CLAUDE_PLUGIN_ROOT}` when run outside Claude Code. `BASH_SOURCE`
+doesn't follow symlinks, so when the SessionStart hook installed
+`~/.local/bin/rcct → ${CLAUDE_PLUGIN_ROOT}/bin/rcct` and the user
+invoked `rcct` from PATH, the wrapper's fallback resolved to
+`~/.local/` — which has no `mcp-server/` subdir, so `uvx --from`
+failed with `Distribution not found at: file:///Users/.../.local/mcp-server`.
+
+Fix: iterate the symlink chain manually before computing the parent
+directory. macOS bash 3.2 has no `readlink -f`, so the loop is
+portable across Linux + macOS. When `${CLAUDE_PLUGIN_ROOT}` is set by
+Claude Code (the common case inside the MCP context), the resolution
+short-circuits — no behavior change there.
+
+Found by exercising `rcct whoami` from a Bash shell. The transport
+itself was fine; the wrapper just couldn't find the package to launch.
+
 ## v0.4.1 — Spec 2/3 polish + tests + delivered-notify
 
 Adds the v0.4.0 test suite, hardens `socket_server` against non-socket
