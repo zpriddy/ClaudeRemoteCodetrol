@@ -4,7 +4,7 @@
   "version": "0.4.2",
   "author": {
     "name": "Zachary Priddy",
-    "email": "anthropic@zpriddy.com"
+    "email": "remotecodetrol@zpriddy.com"
   },
   "license": "MIT",
   "keywords": ["mcp", "notifications", "ios", "remote-control", "cli"]
