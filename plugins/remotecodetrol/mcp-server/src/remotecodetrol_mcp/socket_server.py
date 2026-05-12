@@ -114,35 +114,42 @@ class SocketServer:
     # ---- internals ----
 
     def _handle_stale_socket(self) -> None:
-        """If a socket file exists at our path, decide whether to unlink it.
+        """If a path exists at our socket location, decide whether to unlink it.
 
-        Stale = file exists but no process is listening (connect raises
-        ECONNREFUSED). Live = some other MCP holds it; we should NOT
-        unlink, but we also can't bind — so log and let bind fail loudly.
+        Three cases:
+          - Live socket: another MCP successfully accepts our probe connect.
+            Leave it; our bind will fail loudly so the caller knows.
+          - Stale socket: AF_UNIX file exists but no listener (ECONNREFUSED).
+            Unlink — safe.
+          - Non-socket file (regular file, dir, etc.): connect returns
+            ENOTSOCK or similar. Unlink — anything that's not a live socket
+            at our path is wrong, and asyncio's pre-bind cleanup only
+            handles AF_UNIX sockets.
         """
         if not self.path.exists():
             return
         probe = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
         try:
             probe.connect(str(self.path))
-            # Successfully connected → another MCP owns this socket. Leave
-            # it alone; our bind will fail and the caller can decide.
+            # Successfully connected → another MCP owns this socket.
             probe.close()
             logger.warning(
                 "socket at %s appears to be in use by another MCP process",
                 self.path,
             )
+            return
         except OSError as e:
             probe.close()
-            if e.errno in (errno.ECONNREFUSED, errno.ENOENT):
-                # Stale. Safe to unlink.
-                try:
-                    self.path.unlink()
-                    logger.info("removed stale socket at %s", self.path)
-                except OSError as ue:
-                    logger.warning("failed to unlink stale socket %s: %s", self.path, ue)
-            else:
-                logger.warning("socket probe failed at %s: %s", self.path, e)
+            # Anything that isn't "live socket" → unlink. Includes:
+            #   ECONNREFUSED  — stale AF_UNIX socket from a crashed MCP
+            #   ENOENT        — race: file disappeared between exists() and connect()
+            #   ENOTSOCK      — regular file at the path (not a socket)
+            #   Anything else — unrecognized state; unlinking is the safer default
+            try:
+                self.path.unlink()
+                logger.info("removed non-live path at %s (probe error: %s)", self.path, e)
+            except OSError as ue:
+                logger.warning("failed to unlink %s: %s", self.path, ue)
 
     async def _handle_conn(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
