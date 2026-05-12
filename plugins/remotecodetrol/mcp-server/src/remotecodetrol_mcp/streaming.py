@@ -620,6 +620,16 @@ class SseConsumer:
                 msg = _normalize_message(payload)
                 if self.state.add_message(msg):
                     await self._persist()
+                # Spec 2 (v1.2.0, iOS): notify the backend that this MCP has
+                # received the message so the iOS client can promote its
+                # delivery indicator from gray (sent) → blue lines
+                # (mcp-acked). Fire-and-forget — failures are logged and
+                # ignored, never block the SSE consumer. The endpoint is
+                # idempotent server-side.
+                tid = msg.get("thread_id")
+                mid = msg.get("id")
+                if tid and mid:
+                    asyncio.create_task(self._notify_delivered(tid, mid))
             return
         if evt.event == "message.acked":
             tid = payload.get("thread_id") or payload.get("threadId")
@@ -647,6 +657,45 @@ class SseConsumer:
                 await result
         except Exception as e:  # defensive — disk problems must not kill SSE
             logger.warning("state-file write failed: %s", e)
+
+    async def _notify_delivered(self, thread_id: str, message_id: str) -> None:
+        """Fire-and-forget POST to mark a message as delivered to this MCP.
+
+        Spec 2 (v1.2.0, iOS): drives the iOS tri-state read receipt — sent
+        (gray check) → mcp-acked (blue lines) → claude-acked (solid blue).
+        We don't await the response from the SSE consumer — caller invokes
+        us via `asyncio.create_task` and never checks the result. The
+        backend endpoint is idempotent (no-op if mcpAckedAt already set),
+        so a double-fire on reconnect-with-snapshot-replay is safe.
+
+        Failures (network, 5xx, 4xx other than 401-will-retry-via-client):
+        logged at INFO level. We deliberately avoid the AuthClient's
+        access-token-refresh dance here — if the SSE connection is alive
+        we already have a working token; if it's stale, the SSE loop will
+        reconnect and recover on its own.
+        """
+        try:
+            url = (
+                f"{self.config.api_v1}/threads/"
+                f"{thread_id}/messages/{message_id}/delivered"
+            )
+            token = await self.auth.get_access_token()
+            resp = await self.http.post(
+                url,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=httpx.Timeout(connect=5.0, read=10.0, write=5.0, pool=5.0),
+            )
+            if resp.status_code >= 400 and resp.status_code != 404:
+                # 404 = message vanished (race with a TTL purge), not worth a
+                # WARNING. Anything else, log so we can see persistent issues.
+                logger.info(
+                    "delivered notify: HTTP %d for %s/%s",
+                    resp.status_code,
+                    thread_id,
+                    message_id,
+                )
+        except Exception as e:  # defensive — must never affect SSE health
+            logger.debug("delivered notify failed for %s/%s: %s", thread_id, message_id, e)
 
 
 def _normalize_message(payload: dict[str, Any]) -> dict[str, Any]:

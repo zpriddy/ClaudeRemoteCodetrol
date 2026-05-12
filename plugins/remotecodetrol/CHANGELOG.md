@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.4.1 — Spec 2/3 polish + tests + delivered-notify
+
+Adds the v0.4.0 test suite, hardens `socket_server` against non-socket
+files at the path, and lights up the MCP-side `delivered` notification
+that powers the iOS tri-state read receipts shipping in app v1.2.0.
+
+### Tests
+- 40 new tests across 5 files (`test_v4_auth`, `test_known_threads`,
+  `test_complete_link`, `test_socket_server`, `test_qr`) — covers the
+  v0.4.0 surface end-to-end.
+- 4 stale v0.3.x test files removed (`test_auth`, `test_client`,
+  `test_sse_consumer`, `test_tools`) — they imported v0.3.x-only
+  symbols (`PENDING_FLOW_KEY`, `TokenBundle`) and were broken at
+  baseline. Coverage on `client.py` and the SSE consumer's run-loop
+  is reduced; worth a follow-up sweep.
+
+### Socket server hardening
+- `_handle_stale_socket` now unlinks anything that isn't a live AF_UNIX
+  socket (was: only `ECONNREFUSED` / `ENOENT`). Closes a gap where a
+  regular file at the socket path stranded the MCP with `EADDRINUSE`
+  on bind. Found by the test suite.
+
+### Delivered notification (Spec 2 backend integration)
+- The SSE consumer's `message.created` handler now spawns a
+  fire-and-forget `POST /v1/threads/{tid}/messages/{mid}/delivered` so
+  the backend can stamp `MessageDoc.mcpAckedAt`. iOS reads this to
+  render the second tri-state check (the "blue lines" between sent
+  and Claude-acked).
+- Errors on the call are swallowed at debug level — never blocks the
+  SSE loop.
+
 ## v0.4.0 — Transport rewrite (auth + CLI + thread scoping + QR)
 
 Spec 1 of the v4 trilogy. Replaces the OAuth access+refresh JWT pair
