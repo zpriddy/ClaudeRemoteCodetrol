@@ -1,6 +1,6 @@
 [project]
 name = "remotecodetrol-mcp"
-version = "0.4.3"
+version = "0.4.4"
 description = "MCP server for the RemoteCodetrol iOS notification/remote-control system."
 readme = "README.md"
 license = { text = "MIT" }

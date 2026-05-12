@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.4.4 — Boot-time grandfather of `active_thread` into `known_threads`
+
+Two fixes from a post-restart `whoami` test:
+
+- **`__version__` was stale** (`"0.3.13"`). Bumped to `0.4.4` to match
+  `pyproject.toml` / `plugin.json`. Cosmetic-only — actual code was
+  v0.4.x; just the version constant was unbumped across the v0.4.x
+  cuts.
+
+- **`active_thread` persisted but `known_threads` didn't.** After a
+  Claude Code / MCP restart, `state.json::active_thread` reloads
+  (e.g. `"HackNet"`) but `known_threads` is in-memory only and starts
+  empty. Result: `peek_messages()` and `ack_messages()` on the active
+  thread fail with "thread not in known_threads" until the user
+  explicitly re-declares intent. Sending still worked because
+  `send_message`'s `auto_add=True` path quietly fixed it.
+
+  Fix: at MCP boot in `server.py`, read `_STATE.get()` and seed
+  `known_threads` with it. Treats the persisted active_thread as
+  prior-session intent — same idea as the in-flight auto-add, just
+  applied at startup.
+
+  This deliberately keeps `known_threads` itself in-memory (per spec
+  §5.1); the seed comes from data already on disk.
+
 ## v0.4.3 — Real email in `whoami` (no more `default`)
 
 Backend now returns `email` in the `/v1/oauth/token` and

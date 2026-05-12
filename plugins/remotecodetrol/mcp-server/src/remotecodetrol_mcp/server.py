@@ -54,6 +54,19 @@ _STREAMING = StreamingState()
 for _seed in CONFIG.known_threads_seed:
     _STREAMING.add_known_thread(_seed)
 
+# v0.4.4+: also grandfather the persisted active_thread from state.json into
+# known_threads at boot. Without this, a Claude Code restart leaves the user
+# with an active_thread that's NOT in the allowlist, so peek_messages /
+# ack_messages on it fail with "thread not in known_threads" until the user
+# explicitly re-declares intent. Sending still worked (auto_add=True path)
+# but read flows broke. Treating an already-set active_thread as a prior
+# declaration of intent is the natural fix — the user already chose it
+# in a prior session.
+_persisted_active = _STATE.get()
+if _persisted_active:
+    _STREAMING.add_known_thread(_persisted_active)
+    _STREAMING.active_thread = _persisted_active
+
 _SSE_CONSUMER: SseConsumer | None = None
 if not os.environ.get("RC_DISABLE_STREAMING"):
     _SSE_CONSUMER = SseConsumer(

@@ -3,11 +3,14 @@
 Exposes a FastMCP server that lets Claude Code send messages to and receive
 replies from the RemoteCodetrol iOS app via push notifications.
 
-v0.3.13 — streaming relay: the MCP holds a long-lived SSE connection to
-the backend (see streaming.py + state_file.py) so push events flow into
-Claude's context via a UserPromptSubmit hook between turns. Polling-based
-v0.2.4 callers continue to work; the `poll_interval_seconds` kwarg on
-``wait_for_response`` is accepted and ignored.
+v0.4.x — single 14-day opaque token (replaces v0.3.x JWT pair), `rcct`
+CLI over Unix domain socket, per-session `known_threads` allowlist, ASCII
+QR rendering on link, and backend `email` field returned at issuance so
+`whoami` shows the user's real address (v0.4.3+).
+
+v0.3.x lineage (streaming relay) is still the underlying transport:
+long-lived SSE connection to the backend feeds an in-memory cache and a
+`UserPromptSubmit` hook that surfaces pending replies between turns.
 """
 
-__version__ = "0.3.13"
+__version__ = "0.4.4"
