@@ -152,6 +152,52 @@ If a `wait=True` call times out with no reply, summarize current state
 and stop — don't spin forever. Default timeout is 10 minutes;
 override with `timeout_minutes`.
 
+## Asking with options (v0.5.0)
+
+When the user's reply has a small set of obvious choices ("yes/no",
+"Option A or Option B", "which file?"), attach **selectable response
+buttons** so they can tap once instead of typing. Pass
+`response_options` (1–5 entries) and `selection_mode`:
+
+```
+result = send_message(
+    body="Use **A** (faster build) or **B** (smaller binary)?",
+    require_response=True,
+    response_options=[
+        {"id": "a", "label": "Option A — faster build", "color": "accent"},
+        {"id": "b", "label": "Option B — smaller binary"},
+    ],
+    selection_mode="single",  # or "multi"
+)
+```
+
+**Field rules:**
+- `id`: opaque, alphanumeric/`_`/`-`, ≤32 chars, unique within the list.
+  This is what comes back to you in `selected_option_ids` — use values
+  you can branch on (`"yes"`, `"opt_a"`, `"deploy_now"`), not random UUIDs.
+- `label`: human-readable button text, ≤80 chars, no newlines.
+- `color` (optional): `"neutral" | "accent" | "success" | "warning" | "danger"`.
+  The iOS app maps to a theme token; defaults to neutral.
+- `selection_mode`: `"single"` (tap commits immediately) or `"multi"`
+  (user toggles N selections, then taps Send). Required when
+  `response_options` is non-empty.
+
+**When the reply lands, you get both:**
+- `body` = the selected label(s) joined by `", "` (human-readable,
+  always present, so old code paths still work).
+- `selected_option_ids` = the structured list of `id`s the user tapped
+  (use this for branching).
+
+**When to use it:**
+- ✅ Confirming a destructive action ("Confirm" / "Cancel").
+- ✅ Picking between obvious options Claude has already enumerated.
+- ✅ Anything where typing would be slower than tapping.
+- ❌ Open-ended questions ("what should I name this?") — the composer
+  is always available, but buttons add no value here.
+
+The user can always ignore the buttons and type a freeform reply — the
+composer stays available. If they do, `selected_option_ids` is absent.
+
 ## Stay in checking mode once activated — until user says stop or 2h idle
 
 **This is a hard rule, not case-by-case.**

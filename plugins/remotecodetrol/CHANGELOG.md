@@ -1,5 +1,59 @@
 # Changelog
 
+## v0.5.0 — Selectable response buttons
+
+`send_message` accepts `response_options` (1–5 buttons) +
+`selection_mode` (`single`/`multi`). The iOS app renders tappable
+buttons under the Claude message. The user's reply carries both
+`body` (joined labels, human-readable) and `selected_option_ids`
+(structured ids for branching).
+
+**MCP plugin:**
+- New `ResponseOption` Pydantic model with `id` / `label` / `color`
+  validation. New `MAX_RESPONSE_OPTIONS = 5`, `SelectionMode` literal.
+- `tools.py::send_message` gains `response_options` and
+  `selection_mode` kwargs. Validates locally (cardinality, unique ids,
+  regex on id, no newlines in label) before the network round-trip so
+  bad calls fail fast at the tool boundary, not as a generic 400.
+- `tools.py::Message` adds `response_options`, `selection_mode`,
+  `selected_option_ids` fields — explicit, so the v0.4.5 trap (Pydantic
+  silently dropping wire-format keys via `extra: "ignore"`) doesn't
+  recur.
+- `streaming.py::_normalize_message` maps camelCase
+  `responseOptions`/`selectionMode`/`selectedOptionIds` →
+  snake_case at the cache layer, defense-in-depth for old backends.
+- `skills/remotecodetrol/SKILL.md` documents the new params and when
+  to use buttons vs. plain markdown.
+
+**Backend (companion v0.5.0):**
+- `shared/types.ts::MessageDoc` gains optional `responseOptions`,
+  `selectionMode`, `selectedOptionIds` fields.
+- `api/routes/threads.ts::SendMessageSchema` accepts both camelCase
+  and snake_case for the new fields, validates cross-coupling via
+  `superRefine`, persists in canonical camelCase.
+- `shared/wire.ts::toWireMessage` emits snake_case
+  `response_options`/`selection_mode`/`selected_option_ids` only when
+  non-empty.
+- `infra/modules/firestore/rules/firestore.rules` allows iOS clients
+  to write `selectedOptionIds` (list, ≤5) on user-create messages and
+  forbids the Claude-only `responseOptions`/`selectionMode` keys on
+  user creates.
+
+**iOS (companion v1.3.0):**
+- New `ResponseSelectorView` rendered inside the message bubble; single
+  tap commits in `single` mode, "Send N" pill commits in `multi` mode.
+- `Message` gains `responseOptions`, `selectionMode`,
+  `selectedOptionIds`; `sendUserReply` plumbs through.
+- Theme tokens for selected / unselected / disabled button states with
+  full light + dark variants.
+
+**Compatibility:** all new fields optional, both ends. Old MCP + new
+backend → Claude can't ask with buttons but receives the user's
+`body` text normally. New MCP + old backend → the Zod schema rejects
+the new fields with a 400 (the backend MUST be deployed first). Old
+iOS + new backend → buttons silently absent in render; the message
+body still shows correctly.
+
 ## v0.4.5 — Spec 2 wire fields restored (replied_to, mcp_acked_at, claude_acked_at)
 
 Found by exercising iOS v1.2.0's reply feature: the user tapped Reply,

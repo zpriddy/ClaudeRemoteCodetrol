@@ -726,6 +726,14 @@ def _normalize_message(payload: dict[str, Any]) -> dict[str, Any]:
         out["mcp_acked_at"] = out["mcpAckedAt"]
     if "claude_acked_at" not in out and "claudeAckedAt" in out:
         out["claude_acked_at"] = out["claudeAckedAt"]
+    # v0.5.0: selectable-response fields. Same camelCase→snake_case fallback
+    # for back-compat with any backend version that emits camelCase.
+    if "response_options" not in out and "responseOptions" in out:
+        out["response_options"] = out["responseOptions"]
+    if "selection_mode" not in out and "selectionMode" in out:
+        out["selection_mode"] = out["selectionMode"]
+    if "selected_option_ids" not in out and "selectedOptionIds" in out:
+        out["selected_option_ids"] = out["selectedOptionIds"]
     return out
 
 

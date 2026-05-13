@@ -14,8 +14,9 @@ Thread resolution priority (unchanged from v0.2.4):
 from __future__ import annotations
 
 import asyncio
+import re
 import time
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -56,6 +57,65 @@ class SetThreadResult(BaseModel):
     active_thread: str
 
 
+# ---------- selectable response options (v0.5.0) ----------
+
+ResponseOptionColor = Literal["neutral", "accent", "success", "warning", "danger"]
+SelectionMode = Literal["single", "multi"]
+MAX_RESPONSE_OPTIONS = 5
+# Same regex the backend enforces; we validate locally to surface errors
+# at tool-call time rather than after a network round-trip.
+_OPTION_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+
+class ResponseOption(BaseModel):
+    """A selectable-response button shown under a Claude message in the iOS app.
+
+    `id` is opaque, Claude-chosen, stable across renders. It comes back to
+    Claude as part of `selected_option_ids` so use values that are meaningful
+    for branching ("yes", "opt_a", "deploy_now"), not random uuids.
+    """
+
+    id: str = Field(min_length=1, max_length=32)
+    label: str = Field(min_length=1, max_length=80)
+    color: ResponseOptionColor | None = None
+
+    model_config = {"populate_by_name": True}
+
+
+def _validate_response_options(
+    options: list[ResponseOption] | None,
+    mode: SelectionMode | None,
+) -> None:
+    """Local validation that mirrors the backend Zod schema. Raises ValueError
+    so the MCP returns a structured tool error rather than a 400 from the
+    backend after a wasted round-trip."""
+    if options is None or len(options) == 0:
+        if mode is not None:
+            raise ValueError(
+                "selection_mode requires response_options"
+            )
+        return
+    if mode is None:
+        raise ValueError(
+            "selection_mode is required when response_options is provided"
+        )
+    if len(options) > MAX_RESPONSE_OPTIONS:
+        raise ValueError(
+            f"response_options accepts at most {MAX_RESPONSE_OPTIONS} entries"
+        )
+    ids = [o.id for o in options]
+    if len(set(ids)) != len(ids):
+        raise ValueError("response_options ids must be unique")
+    for o in options:
+        if not _OPTION_ID_RE.match(o.id):
+            raise ValueError(
+                f"response_options id {o.id!r} contains invalid characters"
+                " (allowed: [a-zA-Z0-9_-])"
+            )
+        if "\n" in o.label:
+            raise ValueError("response_options label cannot contain newlines")
+
+
 class Message(BaseModel):
     """Spec §4.1 wire shape, accepts camelCase or snake_case input.
 
@@ -81,6 +141,19 @@ class Message(BaseModel):
     replied_to: str | None = Field(default=None, alias="replied_to")
     mcp_acked_at: str | None = Field(default=None, alias="mcp_acked_at")
     claude_acked_at: str | None = Field(default=None, alias="claude_acked_at")
+    # v0.5.0: selectable-response buttons on Claude messages (set on Claude
+    # sends) and the user's tap-selection on user replies. Pydantic would
+    # silently drop these without explicit declarations — same trap as the
+    # v0.4.5 Spec 2 incident; the test suite below pins the round-trip.
+    response_options: list[ResponseOption] | None = Field(
+        default=None, alias="response_options"
+    )
+    selection_mode: SelectionMode | None = Field(
+        default=None, alias="selection_mode"
+    )
+    selected_option_ids: list[str] | None = Field(
+        default=None, alias="selected_option_ids"
+    )
 
     model_config = {"populate_by_name": True, "extra": "ignore"}
 
@@ -357,6 +430,8 @@ def register_tools(
         timeout_minutes: float | None = None,
         thread: str | None = None,
         idempotency_key: str | None = None,
+        response_options: list[ResponseOption] | None = None,
+        selection_mode: SelectionMode | None = None,
     ) -> SendResult:
         """Send a message to the user via the RemoteCodetrol iOS app.
 
@@ -387,9 +462,30 @@ def register_tools(
         tid = _resolve_thread(state, thread)
         # v0.4.0: sending IS declaring intent — auto-add to known_threads.
         _ensure_known_thread(streaming, tid, auto_add=True)
+        # v0.5.0: the socket-server CLI dispatcher passes args as raw dicts,
+        # so response_options can arrive as list[dict] rather than the typed
+        # list[ResponseOption] FastMCP would deliver. Coerce to ResponseOption
+        # so the validator (and the rest of the function) see a uniform type.
+        if response_options is not None:
+            response_options = [
+                o if isinstance(o, ResponseOption) else ResponseOption.model_validate(o)
+                for o in response_options
+            ]
+        # v0.5.0: validate selectable-response args before the round-trip so
+        # bad input fails fast at the tool boundary (with a clear message)
+        # rather than as a generic 400 from the backend Zod schema.
+        _validate_response_options(response_options, selection_mode)
         payload: dict[str, Any] = {"body": body, "requireResponse": require_response}
         if idempotency_key:
             payload["idempotencyKey"] = idempotency_key
+        # camelCase on the wire to match `requireResponse`/`idempotencyKey`
+        # and the existing Firestore field names. The backend route accepts
+        # snake_case too, but camelCase is canonical here.
+        if response_options is not None and len(response_options) > 0:
+            payload["responseOptions"] = [
+                o.model_dump(exclude_none=True) for o in response_options
+            ]
+            payload["selectionMode"] = selection_mode
         data = await api.post(f"/threads/{tid}/messages", json=payload)
         normalized = _normalize_send_response(data)
         msg_id = normalized.get("messageId") or normalized.get("message_id")
