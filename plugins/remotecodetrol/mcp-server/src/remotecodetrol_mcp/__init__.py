@@ -17,4 +17,4 @@ QR rendering on link, and backend `email` field returned at issuance so
 `whoami` shows the user's real address (v0.4.3+).
 """
 
-__version__ = "0.6.0"
+__version__ = "0.6.1"

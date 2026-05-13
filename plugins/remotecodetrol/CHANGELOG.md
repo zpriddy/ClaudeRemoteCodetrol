@@ -1,5 +1,62 @@
 # Changelog
 
+## v0.6.1 — Free-tier-sustainable polling: armed/dormant + leader election
+
+Two compounding changes that take the v0.6.0 polling consumer from
+"works for solo use" to "works for 10–20 users on Firestore's free
+tier" (50K reads/day).
+
+**Armed / dormant state machine.** The consumer now has a third state
+beyond busy/idle: DORMANT (no recent activity → poll every 5 min).
+The default state at boot is dormant — an MCP that's never been
+asked to do anything contributes only ~288 reads/day, not 1440.
+Tools that expect new traffic (`set_thread`,
+`send_message(require_response=True)`, `peek_messages`,
+`wait_for_response`, `set_waiting`) call `polling.arm()`, which
+flips state to armed AND wakes any in-flight dormant sleep within
+~10 ms via a new `_wake: asyncio.Event`. After 2 hours without an
+`arm()` call, the consumer slips back to dormant on its own (matches
+the cron `/loop` skill's stop condition).
+
+**Leader-elected polling.** A new `leader.py` uses POSIX `fcntl.flock`
+on `~/Library/Caches/remotecodetrol/poll.lock` to ensure exactly one
+MCP per host runs the poll loop, regardless of how many Claude
+sessions are open. Losers go into FOLLOWER mode: no polling, retry
+acquisition every 60 s (in case the leader dies). The OS releases
+flock on process death — no liveness daemon needed. Followers' tool
+calls fall through to reading `pending.json` from disk (the leader's
+output), so `peek_messages` still returns fresh data without anyone
+hitting the backend. `RC_DISABLE_LEADER=1` opts out (every MCP polls,
+v0.6.0 behavior).
+
+**State file v2.** `pending.json` schema bumped to 2 — entries now
+carry the full message dict as `raw` alongside the existing
+preview/id/thread fields. v1 readers (the UserPromptSubmit hook)
+ignore the extra key; followers depend on it to reconstruct the
+cache without hitting the backend. `read_state_file()` tolerates v1
+files and returns `[]` rather than failing.
+
+**Cost math at 20 users, with both changes:**
+- ~1 MCP per host actually polling (vs. one per session)
+- ~80% of day in dormant (300 s) + ~20% armed (60 s avg)
+- Expected reads: ~7K/day, well under the 50 K/day Firestore free tier
+- Expected function invocations: ~7K/day, well under the 2 M/month tier
+
+**iOS scroll bug** (companion fix in main repo):
+- `isAtBottom` defaulted to `true` on first mount — a lie before the
+  LazyVStack rendered. That caused two visible bugs together: opening
+  a thread sometimes landed mid-thread instead of at the latest
+  message, and the jump-to-latest pill (gated on `!isAtBottom`) never
+  showed in that state.
+- Fix: default `isAtBottom = false`, add `didInitialScroll: Bool`,
+  gate `topSentinel.onAppear → loadOlder()` on it. Initial render
+  no longer paginates-up before the snap-to-bottom completes. Pill
+  now shows in any "we're not at the bottom" state, giving the user
+  a one-tap escape hatch if the snap ever races again.
+
+**Plugin tests:** 16/16 polling, 97/97 total.
+**Backend tests:** 51/51 (no backend changes in this release).
+
 ## v0.6.0 — Polling consumer replaces SSE; `stream` Cloud Function removed
 
 **Why:** every SSE connection pinned a Cloud Run instance

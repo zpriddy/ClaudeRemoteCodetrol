@@ -36,6 +36,7 @@ from fastmcp import FastMCP
 from .auth import AuthClient
 from .client import APIClient
 from .config import load_config
+from .leader import LeaderElector, default_lockfile_path
 from .polling import PollingConsumer, PollingPolicy
 from .socket_server import SocketServer
 from .state_file import make_writer
@@ -74,11 +75,21 @@ if _persisted_active:
 
 _POLLING_CONSUMER: PollingConsumer | None = None
 if not os.environ.get("RC_DISABLE_POLLING"):
+    # v0.6.1: leader-elected polling — only one MCP per host runs the
+    # poll loop, regardless of how many Claude sessions the user has
+    # open. Losers (followers) skip polling entirely and serve
+    # peek_messages from the leader's pending.json. RC_DISABLE_LEADER
+    # skips election entirely (every MCP polls); useful for tests or
+    # for diagnosing the leader path itself.
+    _LEADER: LeaderElector | None = None
+    if not os.environ.get("RC_DISABLE_LEADER"):
+        _LEADER = LeaderElector(lockfile_path=default_lockfile_path())
     _POLLING_CONSUMER = PollingConsumer(
         _API,
         _STREAMING,
         policy=PollingPolicy(),
         state_file_writer=make_writer(),
+        leader=_LEADER,
     )
 else:
     _STREAMING.sse_status = "disabled"
