@@ -334,6 +334,7 @@ def register_tools(
     state: ThreadState,
     config: Config,
     streaming: StreamingState | None = None,
+    polling: Any = None,  # PollingConsumer; typed as Any to avoid circular import
 ) -> dict[str, Any]:
     """Bind all @mcp.tool functions onto the given FastMCP instance.
 
@@ -342,8 +343,16 @@ def register_tools(
     socket_server.py uses for the CLI surface (single implementation,
     two surfaces — see spec §4.4).
 
-    `streaming` is optional — when None (or when the SSE consumer is
+    `streaming` is optional — when None (or when the consumer is
     `disabled` / `auth_failed`), tools fall back to direct API calls only.
+
+    v0.6.0: `polling` is the `PollingConsumer` instance (replaces the
+    old SSE consumer). When non-None, blocking call paths
+    (`wait_for_response`, `send_message(wait=True)`) toggle
+    `polling.set_waiting(True/False)` for their duration so the loop
+    cadence tightens to ~2s while a caller is actually blocked. The
+    code is intentionally tolerant of `polling=None` so the tests
+    (which don't spin up a real consumer) keep working.
     """
     dispatchers: dict[str, Any] = {}
 
@@ -391,22 +400,41 @@ def register_tools(
             msgs = [Message.model_validate(m) for m in _messages_from_api(data)]
             return msgs, "api"
 
-        # Push-driven wait on state_change. Clear-before-wait avoids
-        # missing mutations that happened between checks.
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return [], "cache"
-            streaming.state_change.clear()
-            if streaming.sse_status == "auth_failed":
-                return [], "cache"
-            cached = streaming.pending.get(tid, [])
-            if cached:
-                return [Message.model_validate(m) for m in cached], "cache"
-            try:
-                await asyncio.wait_for(streaming.state_change.wait(), timeout=remaining)
-            except asyncio.TimeoutError:
-                return [], "cache"
+        # v0.6.0: tighten the polling cadence for the duration of the
+        # wait. The consumer drops from 60s idle to 2s — the loop is
+        # still doing the actual fetches (which then flip
+        # state_change), this just makes them happen often enough that
+        # the caller sees a reply within seconds of the user tapping.
+        if polling is not None:
+            polling.set_waiting(True)
+        try:
+            # Push-driven wait on state_change. Clear-before-wait avoids
+            # missing mutations that happened between checks.
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return [], "cache"
+                streaming.state_change.clear()
+                if streaming.sse_status == "auth_failed":
+                    return [], "cache"
+                cached = streaming.pending.get(tid, [])
+                if cached:
+                    return [Message.model_validate(m) for m in cached], "cache"
+                try:
+                    await asyncio.wait_for(streaming.state_change.wait(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    return [], "cache"
+        finally:
+            if polling is not None:
+                polling.set_waiting(False)
+
+    # v0.6.1: small helper centralizing the "tell the polling consumer
+    # that activity warrants real-time cadence" call. No-ops if polling
+    # is None (tests, or RC_DISABLE_POLLING=1). Inlined where called
+    # from would duplicate the None-check seven times.
+    def _arm_polling() -> None:
+        if polling is not None:
+            polling.arm()
 
     @mcp.tool
     async def set_thread(name: str) -> SetThreadResult:
@@ -415,11 +443,15 @@ def register_tools(
         The active-thread value is persisted to state.json so it survives
         MCP restarts. The known_threads allowlist is in-memory only and
         re-derived on each MCP launch.
+
+        v0.6.1: arms the polling consumer — the user just declared
+        intent on a thread, so we should be poll-ready for replies.
         """
         state.set(name)
         if streaming is not None:
             streaming.active_thread = name
             streaming.add_known_thread(name)
+        _arm_polling()
         return SetThreadResult(active_thread=name)
 
     @mcp.tool
@@ -462,6 +494,13 @@ def register_tools(
         tid = _resolve_thread(state, thread)
         # v0.4.0: sending IS declaring intent — auto-add to known_threads.
         _ensure_known_thread(streaming, tid, auto_add=True)
+        # v0.6.1: any send arms the consumer; require_response=True arms
+        # PLUS resets the idle-disarm timer. Even a fire-and-forget send
+        # (require_response=False) usually means Claude is about to do
+        # something the user will care about, so it's worth a few
+        # minutes of armed cadence.
+        if require_response:
+            _arm_polling()
         # v0.5.0: the socket-server CLI dispatcher passes args as raw dicts,
         # so response_options can arrive as list[dict] rather than the typed
         # list[ResponseOption] FastMCP would deliver. Coerce to ResponseOption
@@ -527,6 +566,9 @@ def register_tools(
         `since_cursor` is accepted for v0.2.4 back-compat; with the
         cache-first model it's only honored on the API fallback path.
         """
+        # v0.6.1: peeking is an explicit "I expect new traffic" signal —
+        # arm the consumer so we start polling at the active cadence.
+        _arm_polling()
         # All-threads peek: cache-only. Server has no endpoint for this,
         # and the SSE snapshot already covers every thread the user owns.
         # v0.4.0: cache is already filtered by known_threads, so this is
@@ -547,7 +589,25 @@ def register_tools(
             msgs = [Message.model_validate(m) for m in cached]
             return PeekResult(messages=msgs, cursor=None, source="cache")
 
-        # Stale (or no streaming) → direct API call.
+        # v0.6.1: leader-elected polling means our local cache may be
+        # empty even while another MCP on this host is actively polling.
+        # Try the on-disk pending.json (the leader writes it after every
+        # cycle) before falling through to a network call — same data,
+        # zero backend cost.
+        from .state_file import read_state_file as _read_pending_from_disk
+        try:
+            disk_msgs = _read_pending_from_disk()
+        except Exception:
+            disk_msgs = []
+        if disk_msgs:
+            filtered = [m for m in disk_msgs if m.get("thread_id") == tid]
+            if filtered:
+                msgs = [Message.model_validate(m) for m in filtered]
+                return PeekResult(messages=msgs, cursor=None, source="cache")
+
+        # Stale, no streaming, and no leader-written disk cache → direct
+        # API call. This is the back-compat path and also what runs the
+        # very first time after install before any cache exists.
         params: dict[str, Any] = {"unackedOnly": "true"}
         if since_cursor:
             params["since"] = since_cursor

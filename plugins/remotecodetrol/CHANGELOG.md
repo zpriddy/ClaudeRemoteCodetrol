@@ -1,5 +1,122 @@
 # Changelog
 
+## v0.6.1 — Free-tier-sustainable polling: armed/dormant + leader election
+
+Two compounding changes that take the v0.6.0 polling consumer from
+"works for solo use" to "works for 10–20 users on Firestore's free
+tier" (50K reads/day).
+
+**Armed / dormant state machine.** The consumer now has a third state
+beyond busy/idle: DORMANT (no recent activity → poll every 5 min).
+The default state at boot is dormant — an MCP that's never been
+asked to do anything contributes only ~288 reads/day, not 1440.
+Tools that expect new traffic (`set_thread`,
+`send_message(require_response=True)`, `peek_messages`,
+`wait_for_response`, `set_waiting`) call `polling.arm()`, which
+flips state to armed AND wakes any in-flight dormant sleep within
+~10 ms via a new `_wake: asyncio.Event`. After 2 hours without an
+`arm()` call, the consumer slips back to dormant on its own (matches
+the cron `/loop` skill's stop condition).
+
+**Leader-elected polling.** A new `leader.py` uses POSIX `fcntl.flock`
+on `~/Library/Caches/remotecodetrol/poll.lock` to ensure exactly one
+MCP per host runs the poll loop, regardless of how many Claude
+sessions are open. Losers go into FOLLOWER mode: no polling, retry
+acquisition every 60 s (in case the leader dies). The OS releases
+flock on process death — no liveness daemon needed. Followers' tool
+calls fall through to reading `pending.json` from disk (the leader's
+output), so `peek_messages` still returns fresh data without anyone
+hitting the backend. `RC_DISABLE_LEADER=1` opts out (every MCP polls,
+v0.6.0 behavior).
+
+**State file v2.** `pending.json` schema bumped to 2 — entries now
+carry the full message dict as `raw` alongside the existing
+preview/id/thread fields. v1 readers (the UserPromptSubmit hook)
+ignore the extra key; followers depend on it to reconstruct the
+cache without hitting the backend. `read_state_file()` tolerates v1
+files and returns `[]` rather than failing.
+
+**Cost math at 20 users, with both changes:**
+- ~1 MCP per host actually polling (vs. one per session)
+- ~80% of day in dormant (300 s) + ~20% armed (60 s avg)
+- Expected reads: ~7K/day, well under the 50 K/day Firestore free tier
+- Expected function invocations: ~7K/day, well under the 2 M/month tier
+
+**iOS scroll bug** (companion fix in main repo):
+- `isAtBottom` defaulted to `true` on first mount — a lie before the
+  LazyVStack rendered. That caused two visible bugs together: opening
+  a thread sometimes landed mid-thread instead of at the latest
+  message, and the jump-to-latest pill (gated on `!isAtBottom`) never
+  showed in that state.
+- Fix: default `isAtBottom = false`, add `didInitialScroll: Bool`,
+  gate `topSentinel.onAppear → loadOlder()` on it. Initial render
+  no longer paginates-up before the snap-to-bottom completes. Pill
+  now shows in any "we're not at the bottom" state, giving the user
+  a one-tap escape hatch if the snap ever races again.
+
+**Plugin tests:** 16/16 polling, 97/97 total.
+**Backend tests:** 51/51 (no backend changes in this release).
+
+## v0.6.0 — Polling consumer replaces SSE; `stream` Cloud Function removed
+
+**Why:** every SSE connection pinned a Cloud Run instance
+(`containerConcurrency: 1` despite the TF comment claiming 80), driving
+`stream` cost to ~$144/mo per active user and tripping
+`max_instance_count=10` 429s on every new session beyond the cap. For
+solo usage, polling is essentially free.
+
+**MCP plugin:**
+- New `polling.py` with cost-optimized "Option B" defaults: 5s busy,
+  60s idle (growing 2× per empty cycle to 300s ceiling), 2s while a
+  tool is actively waiting on a reply.
+- `next_interval()` is a pure function — no state, no I/O — so it's
+  testable in isolation. All cadence decisions live in one place.
+- `set_waiting(True/False)` toggle invoked by `wait_for_response` and
+  `send_message(wait=True)` for the duration of a blocking call, so
+  the loop tightens to ~2s for the wait then restores normal cadence.
+- `streaming.py` stripped of `SseConsumer`, `SseParser`, `SseEvent`,
+  `next_backoff`, sentinel exceptions. `StreamingState`,
+  `_normalize_message`, `MAX_PENDING_PER_THREAD` stay — the polling
+  consumer reuses the same cache surface so nothing else changes.
+  The `SseStatus` Literal name kept for back-compat (tools.py reads
+  it; renaming everywhere wasn't worth the diff).
+- `server.py` swaps `SseConsumer` → `PollingConsumer` at boot. Env
+  flag renamed `RC_DISABLE_STREAMING` → `RC_DISABLE_POLLING`.
+- Deleted tests: `test_sse_parser.py`, `test_backoff.py`. New tests:
+  `test_polling.py` (7 cases covering `next_interval`, cache
+  population, waiting-mode cadence, camelCase normalization).
+
+**Backend:**
+- Removed `triggers/stream.ts` and the `stream` export from `index.ts`.
+- Removed `formatSseEvent` and `HEARTBEAT_FRAME` from `shared/wire.ts`
+  (only `triggers/stream.ts` used them).
+- Tests for the SSE wire helpers deleted alongside.
+
+**Terraform:**
+- `module.functions.google_cloudfunctions2_function.stream` deleted.
+- `module.functions.google_cloud_run_v2_service_iam_member.stream_invoker_public` deleted.
+- `output.stream_url`, `output.stream_function_name` removed (no
+  external references in this repo).
+
+**Cost impact:** stream function eliminated. Expected savings ≈
+$144/mo at single-user volume. The polling consumer adds a handful
+of `GET /v1/threads/{tid}/messages` calls per minute per active
+session, well under the Cloud Functions 2M-invocation free tier.
+
+**Behavioral trade-off:** average reply latency increases from ~1s
+(SSE) to ~30s at idle cadence (60s poll, average half-window). When
+a tool is actively blocked (`wait=True`) the cadence tightens to 2s
+so the perceived latency is ~1s during interactive question-and-wait
+flows. The cron `loop` skill at 1m granularity is unaffected — it
+was already polling on its own schedule.
+
+**Future:** a `leader.py` could add POSIX-flock leader election so
+only one MCP per host runs the loop (followers read the resulting
+`pending.json` on demand, same path the hook already uses). Deferred
+because the cost case for it is weak at solo-user volume — polling
+is already cheap per-process. Easy to add later if multi-user
+volume picks up.
+
 ## v0.5.0 — Selectable response buttons
 
 `send_message` accepts `response_options` (1–5 buttons) +
