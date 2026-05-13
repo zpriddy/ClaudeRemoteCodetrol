@@ -334,6 +334,7 @@ def register_tools(
     state: ThreadState,
     config: Config,
     streaming: StreamingState | None = None,
+    polling: Any = None,  # PollingConsumer; typed as Any to avoid circular import
 ) -> dict[str, Any]:
     """Bind all @mcp.tool functions onto the given FastMCP instance.
 
@@ -342,8 +343,16 @@ def register_tools(
     socket_server.py uses for the CLI surface (single implementation,
     two surfaces — see spec §4.4).
 
-    `streaming` is optional — when None (or when the SSE consumer is
+    `streaming` is optional — when None (or when the consumer is
     `disabled` / `auth_failed`), tools fall back to direct API calls only.
+
+    v0.6.0: `polling` is the `PollingConsumer` instance (replaces the
+    old SSE consumer). When non-None, blocking call paths
+    (`wait_for_response`, `send_message(wait=True)`) toggle
+    `polling.set_waiting(True/False)` for their duration so the loop
+    cadence tightens to ~2s while a caller is actually blocked. The
+    code is intentionally tolerant of `polling=None` so the tests
+    (which don't spin up a real consumer) keep working.
     """
     dispatchers: dict[str, Any] = {}
 
@@ -391,22 +400,33 @@ def register_tools(
             msgs = [Message.model_validate(m) for m in _messages_from_api(data)]
             return msgs, "api"
 
-        # Push-driven wait on state_change. Clear-before-wait avoids
-        # missing mutations that happened between checks.
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return [], "cache"
-            streaming.state_change.clear()
-            if streaming.sse_status == "auth_failed":
-                return [], "cache"
-            cached = streaming.pending.get(tid, [])
-            if cached:
-                return [Message.model_validate(m) for m in cached], "cache"
-            try:
-                await asyncio.wait_for(streaming.state_change.wait(), timeout=remaining)
-            except asyncio.TimeoutError:
-                return [], "cache"
+        # v0.6.0: tighten the polling cadence for the duration of the
+        # wait. The consumer drops from 60s idle to 2s — the loop is
+        # still doing the actual fetches (which then flip
+        # state_change), this just makes them happen often enough that
+        # the caller sees a reply within seconds of the user tapping.
+        if polling is not None:
+            polling.set_waiting(True)
+        try:
+            # Push-driven wait on state_change. Clear-before-wait avoids
+            # missing mutations that happened between checks.
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return [], "cache"
+                streaming.state_change.clear()
+                if streaming.sse_status == "auth_failed":
+                    return [], "cache"
+                cached = streaming.pending.get(tid, [])
+                if cached:
+                    return [Message.model_validate(m) for m in cached], "cache"
+                try:
+                    await asyncio.wait_for(streaming.state_change.wait(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    return [], "cache"
+        finally:
+            if polling is not None:
+                polling.set_waiting(False)
 
     @mcp.tool
     async def set_thread(name: str) -> SetThreadResult:

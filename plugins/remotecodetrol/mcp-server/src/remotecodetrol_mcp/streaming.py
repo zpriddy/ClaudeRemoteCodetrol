@@ -1,75 +1,78 @@
-"""SSE streaming consumer for the RemoteCodetrol backend.
+"""In-memory message cache for the RemoteCodetrol MCP.
 
-Maintains a long-lived `GET /v1/stream` connection (one per MCP process),
-decodes Server-Sent Events into in-memory `StreamingState`, and notifies
-waiting tools via an `asyncio.Event` whenever the cache mutates.
+Historically (v0.3 – v0.5) this module also held the SSE consumer that
+populated the cache via a long-lived `GET /v1/stream` connection. The
+SSE consumer was removed in v0.6.0 in favor of a polling consumer
+(`polling.py`) because each SSE connection pinned a Cloud Run instance
+(containerConcurrency=1), driving cost to ~$144/mo per active user and
+tripping max-instance 429s under modest fan-out.
 
-Design references: `docs/superpowers/specs/2026-05-07-mcp-streaming-relay-design.md`
-sections §4 (wire protocol) and §5 (state machine + lifecycle).
+What stayed here:
+  * `StreamingState` — the cache + asyncio.Event coordination surface.
+    Tools read `pending` / `state_change` / `known_threads` from this.
+    Renaming was tempting but would touch every test + every importer
+    for marginal clarity — the name is fine.
+  * `_normalize_message` — wire-format key normalizer (camelCase →
+    snake_case fallbacks).
+  * `MAX_PENDING_PER_THREAD`, `FRESH_CACHE_WINDOW_S` — invariants the
+    cache relies on.
+  * `SseStatus` — status enum still used by tools to short-circuit
+    when the consumer is `auth_failed` / `disabled` / `waiting_for_link`.
+    The "Sse"-prefixed name is back-compat: the polling consumer sets
+    the same values to drive the same UX decisions in tools.py.
 
-The cache is a *strict mirror* of server state. We never invent entries
-client-side; on every reconnect, the server's `state.snapshot` becomes the
-new ground truth and we replace `pending` wholesale.
+What's gone:
+  * `SseConsumer`, `SseParser`, `SseEvent`, `next_backoff`,
+    `BACKOFF_MAX_S`, `IDLE_TIMEOUT_S`, `WAITING_FOR_LINK_RETRY_S`,
+    sentinel exceptions. All SSE-only — see git history pre-v0.6.0
+    if you ever need to resurrect them.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import random
-import sys
 import time
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Literal
-
-import httpx
-
-from .auth import AuthClient, AuthError, NotAuthorizedError
-from .config import Config
+from typing import Any, Literal
 
 
 logger = logging.getLogger("remotecodetrol_mcp.streaming")
 
 
-# §5: cap per-thread cache so a degenerate user doesn't OOM the MCP.
+# §5 (original streaming spec): cap per-thread cache so a degenerate
+# user / fan-out spike doesn't OOM the MCP. Polling consumer respects
+# the same cap because it reuses StreamingState.add_message.
 MAX_PENDING_PER_THREAD = 200
 
-# §5: cache_is_fresh window (2 × heartbeat_interval + slack).
+# §5: `cache_is_fresh` window. With the polling consumer the cache is
+# "fresh" as long as the consumer has polled within this window —
+# tools fall through to direct API requests outside it.
 FRESH_CACHE_WINDOW_S = 60.0
 
-# Idle timeout: if no SSE bytes (event or heartbeat comment) arrive for this
-# long, consider the connection dead and reconnect.
-IDLE_TIMEOUT_S = 60.0
 
-# Backoff schedule cap (§5).
-BACKOFF_MAX_S = 30.0
-
-
+# Status enum the consumer publishes via `StreamingState.sse_status`.
+# "Sse"-prefixed for back-compat; both consumer types (historical SSE
+# and current polling) set the same values to drive identical UX
+# decisions in tools.py — e.g. "skip waiting on state_change because
+# the consumer can't authenticate".
 SseStatus = Literal[
     "disconnected",
     "connecting",
     "connected",
     "reconnecting",
-    "waiting_for_link",  # No token in keychain yet — fresh install or post-logout
-    "auth_failed",  # Refresh token revoked by server — terminal until /relink
+    "waiting_for_link",  # No token yet — fresh install or post-logout
+    "auth_failed",  # Token revoked by server — terminal until /relink
     "disabled",
 ]
 
 
-# Backoff (in seconds) when the SSE loop is waiting for the user to link.
-# Longer than connection-error backoff because we expect this to persist on
-# user-time (seconds-to-minutes), not millis. Short enough that re-link is
-# noticed quickly.
-WAITING_FOR_LINK_RETRY_S = 10.0
-
-
 @dataclass
 class StreamingState:
-    """Shared mutable state owned by SseConsumer, read by tools.
+    """Shared mutable state owned by the message consumer, read by tools.
 
     Tools never mutate this directly — they read `pending` / `sse_status`
-    and `await state_change.wait()`. Mutations go through SseConsumer's
+    and `await state_change.wait()`. Mutations go through the consumer's
     handlers (or `prune_acked` after a successful HTTP ack).
     """
 
@@ -80,21 +83,20 @@ class StreamingState:
     active_thread: str | None = None
     last_event_id: str | None = None
     # v0.4.0: Per-process allowlist of threads this Claude session may see.
-    # SSE events for threads NOT in this set are silently dropped at the
+    # Events for threads NOT in this set are silently dropped at the
     # consumer (never cached, never surfaced via tools/hook). Initialised
     # from REMOTECODETROL_KNOWN_THREADS env var; mutated at runtime via
     # set_thread, send_message, forget_thread, and the equivalent CLI
     # subcommands. See spec §5.
     known_threads: set[str] = field(default_factory=set)
-    # Set by SseConsumer at init time. tools.py calls `await persist_now()`
+    # Set by the consumer at init time. tools.py calls `await persist_now()`
     # after a proactive cache prune (HTTP ack path) so the state file stays
-    # in sync — without this, the file lags the cache until SSE delivers a
-    # `message.acked` event back, which then no-ops because the cache is
-    # already pruned. Net: hook re-injects already-acked messages.
+    # in sync — without this, the file lags the cache until the next
+    # consumer iteration delivers a `message.acked`-equivalent back.
     writer: "StateFileWriter | None" = None
 
     async def persist_now(self) -> None:
-        """Trigger an immediate state-file write via the SSE consumer's
+        """Trigger an immediate state-file write via the consumer's
         writer. Used by tools.ack_messages after proactive pruning."""
         if self.writer is None:
             return
@@ -105,7 +107,7 @@ class StreamingState:
         except Exception as e:  # defensive — disk problems must not break ack
             logger.warning("state.persist_now failed: %s", e)
 
-    # ---- mutators (call from SseConsumer or ack path) ----
+    # ---- mutators (call from consumer or ack path) ----
 
     def replace_snapshot(self, messages: list[dict[str, Any]]) -> None:
         """Reset cache to the server's authoritative snapshot.
@@ -241,468 +243,13 @@ class StreamingState:
         return sorted(self.known_threads)
 
 
-# ---------- SSE wire parser ----------
-
-
-@dataclass
-class SseEvent:
-    event: str
-    id: str | None
-    data: str
-    retry_ms: int | None
-
-
-class SseParser:
-    """Stateful parser that reassembles SSE frames from arbitrary chunks.
-
-    Per WHATWG SSE spec:
-      - Lines are separated by `\n`, `\r`, or `\r\n`
-      - Lines starting with `:` are comments (ignored, but count as bytes
-        for our idle-timeout purposes)
-      - `field: value` pairs accumulate into a frame
-      - Multiple `data:` lines within one frame are joined with `\n`
-      - A blank line dispatches the frame
-    """
-
-    def __init__(self) -> None:
-        self._buffer = ""
-        self._event = ""
-        self._data_lines: list[str] = []
-        self._id: str | None = None
-        self._retry_ms: int | None = None
-
-    def feed(self, chunk: str) -> list[SseEvent]:
-        self._buffer += chunk
-        events: list[SseEvent] = []
-        while True:
-            # Find earliest line terminator.
-            line, sep, rest = self._consume_line()
-            if not sep:
-                break
-            self._buffer = rest
-            if line == "":
-                # Dispatch.
-                if self._data_lines or self._event or self._id is not None:
-                    events.append(SseEvent(
-                        event=self._event or "message",
-                        id=self._id,
-                        data="\n".join(self._data_lines),
-                        retry_ms=self._retry_ms,
-                    ))
-                self._event = ""
-                self._data_lines = []
-                self._retry_ms = None
-                # `id` per spec persists across frames (Last-Event-ID), so we
-                # do NOT reset it here. We DO record the most recent `id` on
-                # each frame.
-                continue
-            if line.startswith(":"):
-                # Comment line — ignored. (Our caller still resets the idle
-                # timer on any byte read, so heartbeat comments do their job.)
-                continue
-            field, _, value = line.partition(":")
-            # SSE: a single leading space after the colon is stripped.
-            if value.startswith(" "):
-                value = value[1:]
-            if field == "event":
-                self._event = value
-            elif field == "data":
-                self._data_lines.append(value)
-            elif field == "id":
-                self._id = value
-            elif field == "retry":
-                try:
-                    self._retry_ms = int(value)
-                except ValueError:
-                    pass
-            # Any other field is ignored per spec.
-        return events
-
-    def _consume_line(self) -> tuple[str, bool, str]:
-        """Return (line, found_terminator, remainder)."""
-        buf = self._buffer
-        # Find the first of \r\n, \n, or \r.
-        idx_n = buf.find("\n")
-        idx_r = buf.find("\r")
-        if idx_n == -1 and idx_r == -1:
-            return ("", False, buf)
-        if idx_n != -1 and (idx_r == -1 or idx_n < idx_r):
-            return (buf[:idx_n], True, buf[idx_n + 1:])
-        # \r found first; check if it's part of \r\n.
-        if idx_r + 1 < len(buf) and buf[idx_r + 1] == "\n":
-            return (buf[:idx_r], True, buf[idx_r + 2:])
-        # The buffer ends with a bare \r — we can't be sure yet whether
-        # the next byte will be \n. Treat as incomplete.
-        if idx_r + 1 == len(buf):
-            return ("", False, buf)
-        return (buf[:idx_r], True, buf[idx_r + 1:])
-
-
-# ---------- backoff ----------
-
-
-def next_backoff(
-    attempt: int,
-    hint_ms: int | None,
-    *,
-    rng: random.Random | None = None,
-) -> float:
-    """Compute next reconnect delay (§5).
-
-    If the server provided a `retry:` hint or `event: error` `retry` ms,
-    honor it directly with no jitter. Otherwise: exponential 2^attempt
-    capped at 30s, ±25% jitter.
-    """
-    if hint_ms is not None:
-        return max(0.0, hint_ms / 1000.0)
-    base = min(2 ** attempt, BACKOFF_MAX_S)
-    r = rng or random
-    return base * r.uniform(0.75, 1.25)
-
-
-# ---------- consumer ----------
-
-
-# Optional callback type: state_file_writer(state) -> None or coroutine.
-StateFileWriter = Callable[[StreamingState], Awaitable[None] | None]
-
-
-class SseConsumer:
-    """Long-lived SSE consumer task. One per MCP process."""
-
-    def __init__(
-        self,
-        config: Config,
-        auth: AuthClient,
-        http: httpx.AsyncClient,
-        state: StreamingState,
-        *,
-        state_file_writer: StateFileWriter | None = None,
-        rng: random.Random | None = None,
-    ):
-        self.config = config
-        self.auth = auth
-        self.http = http
-        self.state = state
-        self._state_file_writer = state_file_writer
-        # Wire the writer onto the state so tools (e.g. ack_messages) can
-        # trigger persistence directly after a proactive cache prune.
-        # Without this, the state file lags the cache until SSE delivers
-        # a message.acked round-trip — and then the SSE handler no-ops
-        # because remove_messages returns 0 (already pruned).
-        state.writer = state_file_writer
-        self._rng = rng or random
-        self._task: asyncio.Task[None] | None = None
-        self._stop = asyncio.Event()
-
-    # ---- lifecycle ----
-
-    def start(self) -> asyncio.Task[None]:
-        """Spawn the consumer task. Idempotent."""
-        if self._task is not None and not self._task.done():
-            return self._task
-        self._stop.clear()
-        self._task = asyncio.create_task(self.run(), name="rcct-sse-consumer")
-        return self._task
-
-    async def stop(self) -> None:
-        self._stop.set()
-        if self._task is not None:
-            self._task.cancel()
-            try:
-                await self._task
-            except (asyncio.CancelledError, Exception):
-                pass
-
-    async def run(self) -> None:
-        """Connect → consume → reconnect loop.
-
-        Exits permanently only on `auth_failed` or explicit stop.
-        """
-        attempt = 0
-        retry_hint_ms: int | None = None
-        while not self._stop.is_set():
-            self.state.sse_status = "connecting" if attempt == 0 else "reconnecting"
-            try:
-                await self._connect_and_consume()
-                # Clean close (server hit its 60-min cap or remote end).
-                # Reconnect immediately, no backoff.
-                attempt = 0
-                retry_hint_ms = None
-                continue
-            except _AuthRevokedSentinel:
-                self.state.sse_status = "auth_failed"
-                self.state.bump()
-                logger.error("SSE auth revoked; consumer exiting permanently")
-                return
-            except _NoTokenSentinel:
-                # No token in keychain yet — user hasn't linked, or token
-                # was deleted. Don't exit; wait for /remotecodetrol:link to
-                # write a fresh token and try again. This is the
-                # double-restart-fix: in v0.3.2 and earlier, this case was
-                # conflated with auth_revoked and the consumer exited
-                # permanently, requiring a Claude Code restart after link.
-                self.state.sse_status = "waiting_for_link"
-                self.state.bump()
-                # Reset attempt count — we're not in an exponential-backoff
-                # connection-failure mode; we're idle waiting for an
-                # external trigger.
-                attempt = 0
-                retry_hint_ms = None
-                logger.info(
-                    "SSE: no token; waiting %.0fs for link",
-                    WAITING_FOR_LINK_RETRY_S,
-                )
-                try:
-                    await asyncio.wait_for(
-                        self._stop.wait(), timeout=WAITING_FOR_LINK_RETRY_S
-                    )
-                    return  # _stop fired during sleep
-                except asyncio.TimeoutError:
-                    pass
-                continue
-            except _RetryHintSentinel as e:
-                retry_hint_ms = e.retry_ms
-                attempt += 1
-            except (httpx.HTTPError, OSError, asyncio.IncompleteReadError) as e:
-                logger.info("SSE connection error: %s", e)
-                attempt += 1
-            except asyncio.CancelledError:
-                self.state.sse_status = "disconnected"
-                raise
-            except Exception as e:  # defensive — never let consumer die silently
-                logger.exception("Unexpected SSE consumer error: %s", e)
-                attempt += 1
-
-            if self._stop.is_set():
-                return
-            self.state.sse_status = "reconnecting"
-            delay = next_backoff(attempt, retry_hint_ms, rng=self._rng)
-            retry_hint_ms = None
-            try:
-                await asyncio.wait_for(self._stop.wait(), timeout=delay)
-                return  # _stop fired during sleep
-            except asyncio.TimeoutError:
-                pass
-
-    async def _connect_and_consume(self) -> None:
-        # Use config.stream_url, NOT api_v1 — the stream endpoint is a
-        # separate Cloud Function (e.g. /stream), not a route under the api
-        # function (which would be /api/v1/stream). See config._derive_stream_url
-        # for the derivation rule and the REMOTECODETROL_STREAM_URL override.
-        url = self.config.stream_url
-        try:
-            token = await self.auth.get_access_token()
-        except NotAuthorizedError as e:
-            # No token in keychain (fresh install / post-logout). NOT
-            # terminal: the user might run /remotecodetrol:link in this
-            # same session, after which the next retry will succeed.
-            # Distinguished from AuthError below to avoid the
-            # double-restart bug from v0.3.2 — see run()'s
-            # _NoTokenSentinel handler.
-            logger.info("SSE: no token in keychain (%s); waiting for link", e)
-            raise _NoTokenSentinel()
-        except AuthError as e:
-            # Refresh token rejected by the backend. Terminal — the user
-            # needs to explicitly relink (the existing refresh token is
-            # invalid and we have no way to recover in-process).
-            logger.warning("SSE: refresh token revoked (%s); pausing consumer", e)
-            self.state.sse_status = "auth_failed"
-            self.state.bump()
-            raise _AuthRevokedSentinel()
-
-        headers = {
-            "Accept": "text/event-stream",
-            "Authorization": f"Bearer {token}",
-        }
-        if self.state.last_event_id:
-            headers["Last-Event-ID"] = self.state.last_event_id
-
-        # Use a long-lived stream; httpx supports text/event-stream via
-        # `stream("GET", ...)` returning a Response we can iterate.
-        async with self.http.stream(
-            "GET",
-            url,
-            headers=headers,
-            timeout=httpx.Timeout(connect=10.0, read=None, write=10.0, pool=10.0),
-        ) as resp:
-            if resp.status_code == 401:
-                # Try one refresh; if still 401, treat as revoked.
-                self.auth.invalidate()
-                logger.info("SSE: 401 on connect; will retry after refresh")
-                # Force a reconnect (handled by outer loop). Treating as a
-                # transient connect failure rather than a hard auth_failed:
-                # the next attempt will go through the refresh path in
-                # AuthClient.get_access_token. If THAT fails too, we'll get
-                # NotAuthorizedError and exit via the sentinel.
-                raise httpx.HTTPError("auth refresh required")
-            if resp.status_code == 404:
-                # Old backend without /v1/stream — sleep & retry occasionally.
-                logger.info("SSE: backend lacks /v1/stream (404); degraded mode")
-                self.state.sse_status = "disconnected"
-                self.state.bump()
-                # Treat like a transient error: long-ish backoff hint so we
-                # don't hammer.
-                raise _RetryHintSentinel(60_000)
-            if resp.status_code == 429:
-                retry_after = resp.headers.get("retry-after")
-                ms = None
-                if retry_after:
-                    try:
-                        ms = int(float(retry_after) * 1000)
-                    except ValueError:
-                        pass
-                raise _RetryHintSentinel(ms or 5_000)
-            if resp.status_code >= 400:
-                logger.info("SSE: HTTP %d on connect", resp.status_code)
-                raise httpx.HTTPError(f"HTTP {resp.status_code}")
-
-            self.state.sse_status = "connected"
-            self.state.last_event_at = time.monotonic()
-            self.state.bump()
-
-            parser = SseParser()
-            async for chunk in self._iter_text_with_idle_timeout(resp):
-                self.state.last_event_at = time.monotonic()
-                events = parser.feed(chunk)
-                for evt in events:
-                    if evt.id is not None:
-                        self.state.last_event_id = evt.id
-                    if evt.retry_ms is not None:
-                        # Stash hint for our outer-loop reconnect timing.
-                        # We don't reconnect on a `retry:` field alone — it's
-                        # a hint for *if/when* we reconnect.
-                        pass
-                    await self._dispatch(evt)
-
-    async def _iter_text_with_idle_timeout(
-        self, resp: httpx.Response
-    ):
-        """Yield text chunks; raise OSError on idle timeout.
-
-        We can't use httpx's built-in read timeout because we want a
-        "no bytes for N seconds" semantic, not "any single read takes N".
-        """
-        aiter = resp.aiter_text().__aiter__()
-        while True:
-            try:
-                chunk = await asyncio.wait_for(aiter.__anext__(), timeout=IDLE_TIMEOUT_S)
-            except asyncio.TimeoutError:
-                logger.info("SSE: idle timeout (%.0fs); reconnecting", IDLE_TIMEOUT_S)
-                raise OSError("sse idle timeout")
-            except StopAsyncIteration:
-                return
-            if chunk:
-                yield chunk
-
-    # ---- event handlers ----
-
-    async def _dispatch(self, evt: SseEvent) -> None:
-        try:
-            payload = json.loads(evt.data) if evt.data else {}
-        except json.JSONDecodeError as e:
-            logger.warning("SSE: undecodable data (%s): %r", e, evt.data[:200])
-            return
-
-        if evt.event == "connected":
-            # Per-connection welcome; just log for breadcrumbs.
-            logger.debug("SSE connected: %s", payload)
-            return
-        if evt.event == "state.snapshot":
-            messages = payload.get("pending", []) or []
-            self.state.replace_snapshot(list(messages))
-            await self._persist()
-            return
-        if evt.event == "message.created":
-            # Body is the Message object directly.
-            if isinstance(payload, dict):
-                # Server may use camelCase; normalize the keys we care about.
-                msg = _normalize_message(payload)
-                if self.state.add_message(msg):
-                    await self._persist()
-                # Spec 2 (v1.2.0, iOS): notify the backend that this MCP has
-                # received the message so the iOS client can promote its
-                # delivery indicator from gray (sent) → blue lines
-                # (mcp-acked). Fire-and-forget — failures are logged and
-                # ignored, never block the SSE consumer. The endpoint is
-                # idempotent server-side.
-                tid = msg.get("thread_id")
-                mid = msg.get("id")
-                if tid and mid:
-                    asyncio.create_task(self._notify_delivered(tid, mid))
-            return
-        if evt.event == "message.acked":
-            tid = payload.get("thread_id") or payload.get("threadId")
-            ids = payload.get("message_ids") or payload.get("messageIds") or []
-            if tid and ids:
-                if self.state.remove_messages(tid, list(ids)):
-                    await self._persist()
-            return
-        if evt.event == "error":
-            code = payload.get("code", "")
-            retry_ms = payload.get("retry")
-            logger.info("SSE: server error code=%s retry=%s", code, retry_ms)
-            if code == "auth_revoked":
-                raise _AuthRevokedSentinel()
-            raise _RetryHintSentinel(retry_ms if isinstance(retry_ms, int) else None)
-        # Unknown event types: log & ignore.
-        logger.debug("SSE: ignoring unknown event %r", evt.event)
-
-    async def _persist(self) -> None:
-        if self._state_file_writer is None:
-            return
-        try:
-            result = self._state_file_writer(self.state)
-            if asyncio.iscoroutine(result):
-                await result
-        except Exception as e:  # defensive — disk problems must not kill SSE
-            logger.warning("state-file write failed: %s", e)
-
-    async def _notify_delivered(self, thread_id: str, message_id: str) -> None:
-        """Fire-and-forget POST to mark a message as delivered to this MCP.
-
-        Spec 2 (v1.2.0, iOS): drives the iOS tri-state read receipt — sent
-        (gray check) → mcp-acked (blue lines) → claude-acked (solid blue).
-        We don't await the response from the SSE consumer — caller invokes
-        us via `asyncio.create_task` and never checks the result. The
-        backend endpoint is idempotent (no-op if mcpAckedAt already set),
-        so a double-fire on reconnect-with-snapshot-replay is safe.
-
-        Failures (network, 5xx, 4xx other than 401-will-retry-via-client):
-        logged at INFO level. We deliberately avoid the AuthClient's
-        access-token-refresh dance here — if the SSE connection is alive
-        we already have a working token; if it's stale, the SSE loop will
-        reconnect and recover on its own.
-        """
-        try:
-            url = (
-                f"{self.config.api_v1}/threads/"
-                f"{thread_id}/messages/{message_id}/delivered"
-            )
-            token = await self.auth.get_access_token()
-            resp = await self.http.post(
-                url,
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=httpx.Timeout(connect=5.0, read=10.0, write=5.0, pool=5.0),
-            )
-            if resp.status_code >= 400 and resp.status_code != 404:
-                # 404 = message vanished (race with a TTL purge), not worth a
-                # WARNING. Anything else, log so we can see persistent issues.
-                logger.info(
-                    "delivered notify: HTTP %d for %s/%s",
-                    resp.status_code,
-                    thread_id,
-                    message_id,
-                )
-        except Exception as e:  # defensive — must never affect SSE health
-            logger.debug("delivered notify failed for %s/%s: %s", thread_id, message_id, e)
-
-
 def _normalize_message(payload: dict[str, Any]) -> dict[str, Any]:
     """Normalize wire-format keys to the snake_case our cache stores.
 
-    The spec (§4.1) uses snake_case. Older backends may emit camelCase. We
-    accept either and store snake_case canonically.
+    The original SSE spec (§4.1) uses snake_case. Older backend versions
+    may emit camelCase. We accept either and store snake_case canonically.
+    The polling consumer's API responses go through this same function
+    so the cache shape doesn't change between consumer types.
     """
     out = dict(payload)
     if "thread_id" not in out and "threadId" in out:
@@ -735,28 +282,3 @@ def _normalize_message(payload: dict[str, Any]) -> dict[str, Any]:
     if "selected_option_ids" not in out and "selectedOptionIds" in out:
         out["selected_option_ids"] = out["selectedOptionIds"]
     return out
-
-
-# ---------- internal sentinels ----------
-
-
-class _AuthRevokedSentinel(Exception):
-    """Tell the run loop to exit permanently — token can't be recovered."""
-
-
-class _NoTokenSentinel(Exception):
-    """Tell the run loop to wait for an out-of-process /link to write a token.
-
-    Distinguished from `_AuthRevokedSentinel` because they need different
-    handling: revoked refresh-token is terminal (the consumer has no way
-    to recover without explicit user action), but "no token yet" is
-    expected on fresh installs and clears as soon as `/link` completes.
-    """
-
-
-class _RetryHintSentinel(Exception):
-    """Tell the run loop to honor a server-provided retry hint (ms)."""
-
-    def __init__(self, retry_ms: int | None) -> None:
-        super().__init__(f"retry={retry_ms}")
-        self.retry_ms = retry_ms

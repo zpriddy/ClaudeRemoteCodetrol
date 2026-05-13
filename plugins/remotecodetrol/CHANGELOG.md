@@ -1,5 +1,65 @@
 # Changelog
 
+## v0.6.0 — Polling consumer replaces SSE; `stream` Cloud Function removed
+
+**Why:** every SSE connection pinned a Cloud Run instance
+(`containerConcurrency: 1` despite the TF comment claiming 80), driving
+`stream` cost to ~$144/mo per active user and tripping
+`max_instance_count=10` 429s on every new session beyond the cap. For
+solo usage, polling is essentially free.
+
+**MCP plugin:**
+- New `polling.py` with cost-optimized "Option B" defaults: 5s busy,
+  60s idle (growing 2× per empty cycle to 300s ceiling), 2s while a
+  tool is actively waiting on a reply.
+- `next_interval()` is a pure function — no state, no I/O — so it's
+  testable in isolation. All cadence decisions live in one place.
+- `set_waiting(True/False)` toggle invoked by `wait_for_response` and
+  `send_message(wait=True)` for the duration of a blocking call, so
+  the loop tightens to ~2s for the wait then restores normal cadence.
+- `streaming.py` stripped of `SseConsumer`, `SseParser`, `SseEvent`,
+  `next_backoff`, sentinel exceptions. `StreamingState`,
+  `_normalize_message`, `MAX_PENDING_PER_THREAD` stay — the polling
+  consumer reuses the same cache surface so nothing else changes.
+  The `SseStatus` Literal name kept for back-compat (tools.py reads
+  it; renaming everywhere wasn't worth the diff).
+- `server.py` swaps `SseConsumer` → `PollingConsumer` at boot. Env
+  flag renamed `RC_DISABLE_STREAMING` → `RC_DISABLE_POLLING`.
+- Deleted tests: `test_sse_parser.py`, `test_backoff.py`. New tests:
+  `test_polling.py` (7 cases covering `next_interval`, cache
+  population, waiting-mode cadence, camelCase normalization).
+
+**Backend:**
+- Removed `triggers/stream.ts` and the `stream` export from `index.ts`.
+- Removed `formatSseEvent` and `HEARTBEAT_FRAME` from `shared/wire.ts`
+  (only `triggers/stream.ts` used them).
+- Tests for the SSE wire helpers deleted alongside.
+
+**Terraform:**
+- `module.functions.google_cloudfunctions2_function.stream` deleted.
+- `module.functions.google_cloud_run_v2_service_iam_member.stream_invoker_public` deleted.
+- `output.stream_url`, `output.stream_function_name` removed (no
+  external references in this repo).
+
+**Cost impact:** stream function eliminated. Expected savings ≈
+$144/mo at single-user volume. The polling consumer adds a handful
+of `GET /v1/threads/{tid}/messages` calls per minute per active
+session, well under the Cloud Functions 2M-invocation free tier.
+
+**Behavioral trade-off:** average reply latency increases from ~1s
+(SSE) to ~30s at idle cadence (60s poll, average half-window). When
+a tool is actively blocked (`wait=True`) the cadence tightens to 2s
+so the perceived latency is ~1s during interactive question-and-wait
+flows. The cron `loop` skill at 1m granularity is unaffected — it
+was already polling on its own schedule.
+
+**Future:** a `leader.py` could add POSIX-flock leader election so
+only one MCP per host runs the loop (followers read the resulting
+`pending.json` on demand, same path the hook already uses). Deferred
+because the cost case for it is weak at solo-user volume — polling
+is already cheap per-process. Easy to add later if multi-user
+volume picks up.
+
 ## v0.5.0 — Selectable response buttons
 
 `send_message` accepts `response_options` (1–5 buttons) +
