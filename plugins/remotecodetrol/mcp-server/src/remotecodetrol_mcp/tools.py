@@ -558,21 +558,33 @@ def register_tools(
     ) -> PeekResult:
         """Return unacked user messages.
 
-        If `thread="*"`, returns pending across all threads (cache only —
-        the backend has no all-threads peek endpoint). Otherwise resolves
-        a single thread and reads cache-first, falling back to a direct
-        API call when the cache is stale.
+        v0.6.2: the in-memory + on-disk cache short-circuits were
+        removed. Every peek now goes directly to the backend.
 
-        `since_cursor` is accepted for v0.2.4 back-compat; with the
-        cache-first model it's only honored on the API fallback path.
+        Why: on long threads (or threads with rapid turnover), the
+        cache misses messages. The polling consumer's `unackedOnly=true`
+        fetch caps at `peekMaxLimit` (100) per cycle and never advances
+        a cursor, so anything beyond the first 100 unacked never
+        reaches the cache. Tools that peek expected to see "everything
+        unacked" and instead saw a truncated subset. A direct API call
+        per peek is cheap (one Firestore query, bounded by the same
+        `peekMaxLimit`) and removes the truncation footgun. The cache
+        still exists for the UserPromptSubmit hook's `pending.json`
+        read — that's a different code path and its size cap is fine
+        for "show recent replies between turns".
+
+        For `thread="*"` (all-threads peek), we still use the in-memory
+        cache: the backend has no all-threads endpoint, and iterating
+        every known thread would multiply load. The wildcard is rarely
+        used in practice and the cache is good enough there.
         """
         # v0.6.1: peeking is an explicit "I expect new traffic" signal —
-        # arm the consumer so we start polling at the active cadence.
+        # arm the consumer so we start polling at the active cadence
+        # (for the hook + pending.json path; not for our direct fetch).
         _arm_polling()
-        # All-threads peek: cache-only. Server has no endpoint for this,
-        # and the SSE snapshot already covers every thread the user owns.
-        # v0.4.0: cache is already filtered by known_threads, so this is
-        # automatically scoped to known threads only.
+
+        # All-threads peek: cache-only (no backend endpoint exists).
+        # Caveat documented in the docstring above.
         if thread == "*":
             if streaming is None:
                 return PeekResult(messages=[], cursor=None, source="cache")
@@ -584,30 +596,11 @@ def register_tools(
         # we're preventing — reject rather than auto-add.
         _ensure_known_thread(streaming, tid, auto_add=False)
 
-        if _cache_fresh() and streaming is not None:
-            cached = streaming.pending.get(tid, [])
-            msgs = [Message.model_validate(m) for m in cached]
-            return PeekResult(messages=msgs, cursor=None, source="cache")
-
-        # v0.6.1: leader-elected polling means our local cache may be
-        # empty even while another MCP on this host is actively polling.
-        # Try the on-disk pending.json (the leader writes it after every
-        # cycle) before falling through to a network call — same data,
-        # zero backend cost.
-        from .state_file import read_state_file as _read_pending_from_disk
-        try:
-            disk_msgs = _read_pending_from_disk()
-        except Exception:
-            disk_msgs = []
-        if disk_msgs:
-            filtered = [m for m in disk_msgs if m.get("thread_id") == tid]
-            if filtered:
-                msgs = [Message.model_validate(m) for m in filtered]
-                return PeekResult(messages=msgs, cursor=None, source="cache")
-
-        # Stale, no streaming, and no leader-written disk cache → direct
-        # API call. This is the back-compat path and also what runs the
-        # very first time after install before any cache exists.
+        # v0.6.2: always direct API. No cache short-circuit, no
+        # on-disk pending.json fallback — those layers were the source
+        # of the long-thread missing-message bug. The trade-off is one
+        # Firestore-bounded query per peek; cheap at solo + small-team
+        # scale, and ack-driven flows still naturally batch.
         params: dict[str, Any] = {"unackedOnly": "true"}
         if since_cursor:
             params["since"] = since_cursor

@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.6.2 — peek_messages always hits the API; cache shortcut removed
+
+`peek_messages` no longer consults the in-memory cache or the
+on-disk `pending.json` for single-thread peeks. Every call goes
+directly to `GET /v1/threads/{tid}/messages?unackedOnly=true`.
+
+Why: on long threads the cache silently truncated. The polling
+consumer's per-cycle fetch caps at `peekMaxLimit` (100 messages by
+default) and didn't advance a cursor, so anything beyond the first
+100 unacked replies never landed in the cache. Tools that called
+`peek_messages` expecting "everything unacked" got a subset and
+couldn't see why. The cache short-circuit was meant to save
+backend cost; the actual cost saved was negligible (one Firestore
+query per tool call) and the bug it caused was significant.
+
+Unchanged:
+- The polling consumer still writes `pending.json` for the
+  UserPromptSubmit hook between turns — that path benefits from
+  the cache and isn't affected by the truncation (the hook only
+  shows recent replies, not a full audit).
+- `peek_messages(thread="*")` still uses the in-memory cache: the
+  backend has no all-threads endpoint, and iterating every known
+  thread per peek would be a real cost. The wildcard's rare usage
+  makes its staleness window acceptable.
+
 ## v0.6.1 — Free-tier-sustainable polling: armed/dormant + leader election
 
 Two compounding changes that take the v0.6.0 polling consumer from
