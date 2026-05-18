@@ -177,6 +177,17 @@ class AckResult(BaseModel):
     acked: int
 
 
+class GetMessagesResult(BaseModel):
+    """v0.7.0: combined peek + ack result. `messages` is the list of
+    unacked user messages that just got acked; `acked` is the count.
+    Use when you want to consume all pending replies in one shot —
+    saves Claude the bookkeeping of peek → process → collect-ids → ack.
+    """
+
+    messages: list[Message]
+    acked: int
+
+
 class ThreadSummary(BaseModel):
     name: str
     last_message_at: str | None = Field(default=None, alias="lastMessageAt")
@@ -639,6 +650,61 @@ def register_tools(
         return AckResult(acked=len(message_ids))
 
     @mcp.tool
+    async def get_messages(
+        thread: str | None = None,
+    ) -> GetMessagesResult:
+        """**Combined peek + ack** — fetch all unacked user replies on
+        a thread AND ack them in one tool call. Returns the messages
+        so Claude has them in context to respond to.
+
+        Use this when you want to *consume* the current pending replies
+        — i.e. you intend to act on them. Use `peek_messages` instead
+        when you want a read-only look (e.g. "is there anything new?"
+        before deciding whether to ack).
+
+        Equivalent to:
+            result = peek_messages(thread=thread)
+            ack_messages(message_ids=[m.id for m in result.messages],
+                         thread=thread)
+            return result.messages
+
+        Safety:
+          - If peek returns 0 messages, ack is skipped (no empty POST).
+          - If ack fails after peek succeeded, the messages stay
+            unacked on the server; next peek will return them again.
+            Better than the inverse (losing them to a successful ack
+            on a failed read).
+        """
+        tid = _resolve_thread(state, thread)
+        _ensure_known_thread(streaming, tid, auto_add=False)
+        _arm_polling()
+
+        # Peek directly via the API (v0.6.2: cache removed for peeks).
+        data = await api.get(
+            f"/threads/{tid}/messages", params={"unackedOnly": "true"}
+        )
+        raw_msgs = _messages_from_api(data)
+        if not raw_msgs:
+            return GetMessagesResult(messages=[], acked=0)
+
+        msgs = [Message.model_validate(m) for m in raw_msgs]
+        message_ids = [m.id for m in msgs if m.id]
+
+        # Ack them. APIClient raises on non-2xx, so reaching the post-
+        # ack code means HTTP 2xx. If the ack fails (network blip,
+        # auth churn) we surface the error to the caller — they need
+        # to know the messages are STILL unacked.
+        await api.post(f"/threads/{tid}/ack", json={"messageIds": message_ids})
+
+        # Prune the in-memory cache + persist so the hook doesn't
+        # re-inject these on the next prompt.
+        if streaming is not None:
+            streaming.prune_acked(tid, message_ids)
+            await streaming.persist_now()
+
+        return GetMessagesResult(messages=msgs, acked=len(message_ids))
+
+    @mcp.tool
     async def list_threads() -> list[ThreadSummary]:
         """List ALL the user's threads with last-activity timestamps.
 
@@ -867,6 +933,7 @@ def register_tools(
     _expose("send_message", send_message)
     _expose("peek_messages", peek_messages)
     _expose("ack_messages", ack_messages)
+    _expose("get_messages", get_messages)
     _expose("list_threads", list_threads)
     _expose("forget_thread", forget_thread)
     _expose("list_known_threads", list_known_threads)

@@ -1,5 +1,52 @@
 # Changelog
 
+## v0.7.0 — `/rc:` slash commands; new `get_messages` tool; CLI parity
+
+Two changes you'll notice immediately:
+
+**1. Slash command prefix is now `/rc:` (was `/remotecodetrol:`).**
+   - Plugin name changed in `plugin.json` from `remotecodetrol` → `rc`.
+     This is the only place that prefix is derived from.
+   - All slash commands: `/rc:link`, `/rc:send_message`,
+     `/rc:send_wait`, `/rc:wait_blocked`, `/rc:peek`, `/rc:ack`,
+     `/rc:get_messages`.
+   - MCP tool names changed in lockstep:
+     `mcp__plugin_remotecodetrol_bridge__*` → `mcp__plugin_rc_bridge__*`.
+   - **Breaking** for anyone with hand-rolled scripts referencing the
+     old tool names; Claude reads tool descriptions per session so its
+     own behavior re-adapts automatically.
+
+**2. New `get_messages` MCP tool + CLI subcommand.**
+   - Combined `peek_messages` + `ack_messages` in one round-trip.
+     Returns the messages so Claude can act on them, and they're
+     already acked when the call returns.
+   - The most common "consume new replies" pattern (peek → process →
+     ack) collapses to a single tool call.
+   - Safety: if peek succeeds but ack fails, the tool surfaces the
+     error and messages stay unacked on the server (better than the
+     inverse: silent loss after a successful ack on a failed read).
+
+**Six new slash commands** matching the user's preferred naming:
+   - `/rc:send_message` — fire-and-forget send
+   - `/rc:send_wait` — send + block until reply (timeout-bounded)
+   - `/rc:wait_blocked` — block waiting for a reply on the active
+     thread (no send; default 10-min timeout)
+   - `/rc:peek` — read-only check (no ack)
+   - `/rc:ack` — manual ack of specific ids
+   - `/rc:get_messages` — combined peek + ack (the 90% case)
+
+**Three new CLI subcommands** for parity:
+   - `rcct send-wait` — maps to `send_message(require_response=True, wait=True)`
+   - `rcct peek` — alias of existing `rcct check`
+   - `rcct get-messages` — maps to the new `get_messages` MCP tool
+
+   `rcct send`, `rcct check`, `rcct wait`, `rcct ack` all keep working
+   as before — no breaking CLI changes.
+
+**Internal: `wait-blocked` is an alias of `wait`** (different name,
+same `wait_for_response` plumbing). The 10-min default lives in the
+slash command spec (`/rc:wait_blocked.md`), not the CLI.
+
 ## v0.6.2 — peek_messages always hits the API; cache shortcut removed
 
 `peek_messages` no longer consults the in-memory cache or the

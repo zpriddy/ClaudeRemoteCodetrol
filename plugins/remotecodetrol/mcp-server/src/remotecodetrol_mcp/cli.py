@@ -58,35 +58,78 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_send = sub.add_parser("send", help="Send a message to the user")
-    p_send.add_argument("body", help="Message body (markdown rendered)")
-    p_send.add_argument("--thread", help="Override active thread")
-    p_send.add_argument(
-        "--require-response",
-        action="store_true",
-        help="Mark the message as expecting a reply",
+    # `send` / `send-message` are the same command. The `send-message`
+    # alias was added in v0.7.0 to match the slash command naming
+    # (/rc:send_message).
+    for send_name in ("send", "send-message"):
+        p_send = sub.add_parser(send_name, help="Send a message to the user")
+        p_send.add_argument("body", help="Message body (markdown rendered)")
+        p_send.add_argument("--thread", help="Override active thread")
+        p_send.add_argument(
+            "--require-response",
+            action="store_true",
+            help="Mark the message as expecting a reply",
+        )
+        p_send.add_argument(
+            "--idempotency-key", help="Idempotency key for de-dup on the server"
+        )
+
+    # v0.7.0: send + block until reply, in one call. Maps to
+    # send_message(require_response=True, wait=True). The CLI exposes
+    # `--timeout` so callers can override the default; without it we use
+    # the server's `default_timeout_minutes` config (usually 10).
+    p_send_wait = sub.add_parser(
+        "send-wait",
+        help="Send a message and block until the user replies (one round-trip)",
     )
-    p_send.add_argument(
+    p_send_wait.add_argument("body", help="Message body (markdown rendered)")
+    p_send_wait.add_argument("--thread", help="Override active thread")
+    p_send_wait.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        help="Minutes to wait for the reply before giving up. Default: server config.",
+    )
+    p_send_wait.add_argument(
         "--idempotency-key", help="Idempotency key for de-dup on the server"
     )
 
-    p_check = sub.add_parser("check", help="Show pending replies (peek_messages)")
-    p_check.add_argument("--thread", help="Override active thread")
-    p_check.add_argument(
-        "--all",
-        action="store_true",
-        help="Return pending across all known threads (cache only)",
-    )
+    # `check` / `peek` are the same command. `peek` was added in v0.7.0
+    # to match the slash command (/rc:peek) and the MCP tool
+    # (peek_messages). `check` is kept as an alias for back-compat with
+    # users who built muscle memory pre-v0.7.0.
+    for peek_name in ("check", "peek"):
+        p_check = sub.add_parser(
+            peek_name, help="Show pending replies (peek_messages) — no ack"
+        )
+        p_check.add_argument("--thread", help="Override active thread")
+        p_check.add_argument(
+            "--all",
+            action="store_true",
+            help="Return pending across all known threads (cache only)",
+        )
 
-    p_wait = sub.add_parser(
-        "wait", help="Wait for a reply (one-shot, with timeout)"
-    )
-    p_wait.add_argument("--thread", help="Override active thread")
-    p_wait.add_argument("--timeout", type=float, default=None, help="Minutes")
+    # `wait` / `wait-blocked` are the same command. `wait-blocked` was
+    # added in v0.7.0 to match the slash command naming (/rc:wait_blocked).
+    for wait_name in ("wait", "wait-blocked"):
+        p_wait = sub.add_parser(
+            wait_name, help="Wait for a reply (one-shot, with timeout)"
+        )
+        p_wait.add_argument("--thread", help="Override active thread")
+        p_wait.add_argument("--timeout", type=float, default=None, help="Minutes")
 
     p_ack = sub.add_parser("ack", help="Acknowledge processed messages")
     p_ack.add_argument("message_ids", nargs="+", help="Firestore doc ids")
     p_ack.add_argument("--thread", help="Override active thread")
+
+    # v0.7.0: combined peek + ack. Returns the messages that were just
+    # acked so Claude can act on them without separate fetch + ack
+    # bookkeeping. Maps to the new MCP tool `get_messages`.
+    p_get = sub.add_parser(
+        "get-messages",
+        help="Fetch all unacked replies AND ack them (one round-trip)",
+    )
+    p_get.add_argument("--thread", help="Override active thread")
 
     sub.add_parser("link", help="Start the OAuth device-code flow + show QR")
     sub.add_parser(
@@ -113,7 +156,7 @@ def _build_request(ns: argparse.Namespace) -> tuple[str, dict[str, Any]]:
 
     Returns command names that match MCP tool names exactly.
     """
-    if ns.cmd == "send":
+    if ns.cmd in ("send", "send-message"):
         args: dict[str, Any] = {
             "body": ns.body,
             "require_response": bool(ns.require_response),
@@ -123,14 +166,30 @@ def _build_request(ns: argparse.Namespace) -> tuple[str, dict[str, Any]]:
         if ns.idempotency_key:
             args["idempotency_key"] = ns.idempotency_key
         return "send_message", args
-    if ns.cmd == "check":
+    if ns.cmd == "send-wait":
+        # v0.7.0: send_message(require_response=True, wait=True) — the
+        # MCP blocks inside the tool call until a reply arrives or the
+        # timeout elapses. The result's `pending_messages` is the reply.
+        args = {
+            "body": ns.body,
+            "require_response": True,
+            "wait": True,
+        }
+        if ns.thread:
+            args["thread"] = ns.thread
+        if ns.timeout is not None:
+            args["timeout_minutes"] = ns.timeout
+        if ns.idempotency_key:
+            args["idempotency_key"] = ns.idempotency_key
+        return "send_message", args
+    if ns.cmd in ("check", "peek"):
         args = {}
         if ns.all:
             args["thread"] = "*"
         elif ns.thread:
             args["thread"] = ns.thread
         return "peek_messages", args
-    if ns.cmd == "wait":
+    if ns.cmd in ("wait", "wait-blocked"):
         args = {}
         if ns.thread:
             args["thread"] = ns.thread
@@ -142,6 +201,12 @@ def _build_request(ns: argparse.Namespace) -> tuple[str, dict[str, Any]]:
         if ns.thread:
             args["thread"] = ns.thread
         return "ack_messages", args
+    if ns.cmd == "get-messages":
+        # v0.7.0: combined peek + ack via the new MCP tool.
+        args = {}
+        if ns.thread:
+            args["thread"] = ns.thread
+        return "get_messages", args
     if ns.cmd == "link":
         return "link", {}
     if ns.cmd == "check-link":
@@ -248,6 +313,18 @@ def _format_human(cmd: str, result: dict[str, Any]) -> str:
         return _format_human("peek_messages", result)
     if cmd == "ack_messages" and isinstance(payload, dict):
         return f"acked {payload.get('acked', 0)}"
+    if cmd == "get_messages" and isinstance(payload, dict):
+        msgs = payload.get("messages") or []
+        acked = payload.get("acked", 0)
+        if not msgs:
+            return "(no pending messages)"
+        lines = [f"got + acked {acked} messages:"]
+        for m in msgs:
+            tid = m.get("thread_name") or m.get("thread_id") or "?"
+            body = (m.get("body") or "").replace("\n", " ")
+            mid = m.get("id", "?")
+            lines.append(f"  [{tid}] {mid}  {body[:120]}")
+        return "\n".join(lines)
     if cmd == "whoami" and isinstance(payload, dict):
         lines = [
             f"email:           {payload.get('email')}",
@@ -328,11 +405,11 @@ async def _async_main(argv: list[str]) -> int:
             f"error: MCP server not responding at {socket_path}\n\n"
             "This usually means:\n"
             "  - You're not running inside a Claude Code session with the "
-            "remotecodetrol plugin loaded.\n"
+            "RemoteCodetrol plugin loaded.\n"
             "  - The plugin isn't installed or hasn't been linked yet.\n"
             "\n"
-            "Try: open a Claude Code session with the remotecodetrol "
-            "plugin enabled, or run /remotecodetrol:link.\n"
+            "Try: open a Claude Code session with the plugin enabled, "
+            "or run /rc:link.\n"
             f"\n(transport detail: {e})\n"
         )
         return 2

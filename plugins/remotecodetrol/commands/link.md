@@ -7,7 +7,7 @@ RemoteCodetrol backend so the MCP can send pushes to their iPhone.
 
 Steps:
 
-1. Call the **`link`** MCP tool (`mcp__plugin_remotecodetrol_bridge__link`)
+1. Call the **`link`** MCP tool (`mcp__plugin_rc_bridge__link`)
    with no arguments. CLI equivalent: `rcct link`.
 
 2. Inspect the result:
@@ -40,7 +40,7 @@ Steps:
 
    **Exception:** if the user explicitly says "I confirmed" / "I tapped
    it" / "done" or equivalent, call **`complete_link`**
-   (`mcp__plugin_remotecodetrol_bridge__complete_link`) — CLI:
+   (`mcp__plugin_rc_bridge__complete_link`) — CLI:
    `rcct check-link`. This bypasses both client-side and server-side
    polling cooldowns and returns `authorized | pending | expired |
    denied | invalid` immediately. On `authorized`, show the email.
