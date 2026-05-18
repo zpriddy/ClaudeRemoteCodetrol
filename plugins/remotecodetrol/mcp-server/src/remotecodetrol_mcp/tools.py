@@ -14,9 +14,12 @@ Thread resolution priority (unchanged from v0.2.4):
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import time
 from typing import Any, Literal
+
+logger = logging.getLogger("remotecodetrol_mcp.tools")
 
 from pydantic import BaseModel, Field
 
@@ -385,56 +388,83 @@ def register_tools(
         tid: str, timeout_minutes: float
     ) -> tuple[list[Message], str]:
         """Block until a reply lands on `tid`, or timeout. Returns
-        `(messages, source)` where source is "cache" | "api" — same shape
-        as PeekResult but tuple to keep the helper composable.
+        `(messages, source)` where source is "api" (cache reads were
+        removed in v0.7.2 — see below).
 
         Used by both wait_for_response and (v0.3.9+) send_message with
-        wait=True. Behavior:
-          - Cache fresh + already has pending → immediate cache return
-          - SSE unavailable (no streaming / auth_failed / disabled) →
-            single direct-API check, no polling. Returns whatever's there.
-          - Otherwise → block on streaming.state_change, re-check on
-            each wake, until timeout.
+        wait=True.
+
+        v0.7.2: removed all cache reads from this path. Previously this
+        function would return immediately if `streaming.pending` had
+        anything cached for `tid` — but the cache can hold stale entries
+        (e.g., another session acked the message but this MCP's prune
+        notification path didn't fire), so the returned data was
+        sometimes lying about pending state. Symptom: `wait_for_response`
+        and `peek_messages` returning nothing even though new messages
+        existed on the backend; only `send_message`'s bundling path
+        (which queries Firestore directly) saw the truth.
+
+        Current behavior:
+          - Direct API peek first. If anything pending, return it.
+          - If nothing: wait on `streaming.state_change` (set by the
+            polling consumer on every cache mutation) as a wake signal,
+            then re-peek the API. Loop until timeout.
+          - If no streaming consumer (RC_DISABLE_POLLING=1 or
+            auth_failed): single direct API peek, no waiting.
+
+        Cost: each state_change wake = 1 API call. In waiting mode the
+        polling cadence is 2s, so up to ~30 API calls/min during a
+        wait. Acceptable — well under free-tier limits and bounded by
+        the timeout.
         """
         deadline = time.monotonic() + float(timeout_minutes) * 60
 
-        # Already have something cached → instant return.
-        if streaming is not None and streaming.pending.get(tid):
-            cached = streaming.pending.get(tid, [])
-            return [Message.model_validate(m) for m in cached], "cache"
-
-        # Streaming unavailable → single API peek, no waiting.
-        if streaming is None or streaming.sse_status in ("auth_failed", "disabled"):
+        async def _fresh_peek() -> list[Message]:
             data = await api.get(
                 f"/threads/{tid}/messages", params={"unackedOnly": "true"}
             )
-            msgs = [Message.model_validate(m) for m in _messages_from_api(data)]
-            return msgs, "api"
+            return [Message.model_validate(m) for m in _messages_from_api(data)]
 
-        # v0.6.0: tighten the polling cadence for the duration of the
-        # wait. The consumer drops from 60s idle to 2s — the loop is
-        # still doing the actual fetches (which then flip
-        # state_change), this just makes them happen often enough that
-        # the caller sees a reply within seconds of the user tapping.
+        # Initial direct check. Bypasses any cache state entirely.
+        initial = await _fresh_peek()
+        if initial:
+            return initial, "api"
+
+        # Nothing yet. If we have no consumer to wake us, just return
+        # empty (caller decides whether to retry / send again).
+        if streaming is None or streaming.sse_status in ("auth_failed", "disabled"):
+            return [], "api"
+
+        # Tighten polling cadence to 2s for the wait window; restore on
+        # exit. The polling consumer's add_message → state_change set is
+        # what wakes this loop on each new arrival.
         if polling is not None:
             polling.set_waiting(True)
         try:
-            # Push-driven wait on state_change. Clear-before-wait avoids
-            # missing mutations that happened between checks.
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    return [], "cache"
+                    return [], "api"
                 streaming.state_change.clear()
                 if streaming.sse_status == "auth_failed":
-                    return [], "cache"
-                cached = streaming.pending.get(tid, [])
-                if cached:
-                    return [Message.model_validate(m) for m in cached], "cache"
+                    return [], "api"
                 try:
-                    await asyncio.wait_for(streaming.state_change.wait(), timeout=remaining)
+                    # Cap the sleep at 30s so we periodically re-poll
+                    # the API even if state_change never fires —
+                    # defense in depth against a stuck polling consumer.
+                    await asyncio.wait_for(
+                        streaming.state_change.wait(),
+                        timeout=min(remaining, 30.0),
+                    )
                 except asyncio.TimeoutError:
-                    return [], "cache"
+                    pass  # fall through to re-check
+                # Always re-query the API after a wake. Cache may have
+                # received the message but we don't read it — going to
+                # source of truth removes the entire stale-cache class
+                # of bugs from this code path.
+                msgs = await _fresh_peek()
+                if msgs:
+                    return msgs, "api"
         finally:
             if polling is not None:
                 polling.set_waiting(False)
@@ -594,13 +624,34 @@ def register_tools(
         # (for the hook + pending.json path; not for our direct fetch).
         _arm_polling()
 
-        # All-threads peek: cache-only (no backend endpoint exists).
-        # Caveat documented in the docstring above.
+        # All-threads peek: iterate every known thread and direct-API
+        # peek each. v0.7.2 dropped the cache-only short-circuit — the
+        # in-memory cache was returning stale entries (added by polling
+        # but not pruned when another session acked them), so peek
+        # results lied about pending state. The trade-off is N API
+        # calls instead of 1, where N is len(known_threads); typically
+        # 1-3 in practice. Each call is bounded by `peekMaxLimit`.
         if thread == "*":
-            if streaming is None:
-                return PeekResult(messages=[], cursor=None, source="cache")
-            msgs = [Message.model_validate(m) for m in streaming.all_pending()]
-            return PeekResult(messages=msgs, cursor=None, source="cache")
+            if streaming is None or not streaming.known_threads:
+                return PeekResult(messages=[], cursor=None, source="api")
+            all_msgs: list[Message] = []
+            for known_tid in sorted(streaming.known_threads):
+                try:
+                    data = await api.get(
+                        f"/threads/{known_tid}/messages",
+                        params={"unackedOnly": "true"},
+                    )
+                    for raw in _messages_from_api(data):
+                        all_msgs.append(Message.model_validate(raw))
+                except Exception as exc:
+                    # One bad thread shouldn't blank the whole wildcard
+                    # peek. Skip + continue.
+                    logger.warning(
+                        "wildcard peek failed for thread=%s: %s",
+                        known_tid, exc,
+                    )
+                    continue
+            return PeekResult(messages=all_msgs, cursor=None, source="api")
 
         tid = _resolve_thread(state, thread)
         # v0.4.0: peeking on an undeclared thread is the cross-session leak

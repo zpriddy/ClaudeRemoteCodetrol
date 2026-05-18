@@ -1,5 +1,53 @@
 # Changelog
 
+## v0.7.2 — purge cache reads from peek / wait / send_message(wait=True)
+
+Reported: `peek_messages` and `get_messages` returning nothing even
+when new replies existed on the backend. Only `send_message`'s
+bundling path (which queries Firestore directly via collection-group)
+saw the truth. The agent's diagnosis ("cursor was stuck") was
+half-right — the actual bug was the in-memory `streaming.pending`
+cache holding stale entries.
+
+Two code paths still read from the cache instead of going direct:
+
+1. **`_await_reply_for_thread`** — used by `wait_for_response` and by
+   `send_message(wait=True)`. Short-circuited on cache hit at function
+   entry AND on every state_change wake. If the cache contained any
+   entry for the thread (even stale ones from before another session's
+   ack), the wait returned immediately with stale data — never
+   consulting the backend.
+2. **`peek_messages(thread="*")`** — wildcard peek was cache-only by
+   design ("the backend has no all-threads endpoint"). The cache could
+   be stale if the polling consumer hadn't recently polled, or if
+   another session had pruned without notifying this one.
+
+**Fix in v0.7.2:**
+
+- `_await_reply_for_thread` now does an initial direct API peek, then
+  if empty waits on `state_change` for wake signals — and **re-peeks
+  the API on every wake**, never the cache. Cap the inner sleep at
+  30 s so we periodically re-poll even if the consumer is stuck.
+- `peek_messages(thread="*")` now iterates `known_threads` and direct-
+  API peeks each. Trade-off: N API calls instead of 1, where N is
+  typically 1-3. One slow / failing thread is skipped + logged rather
+  than blanking the whole result.
+
+The polling consumer still writes `pending.json` for the
+`UserPromptSubmit` hook (different use case, cache is fine there). All
+tool-call read paths (`peek_messages`, `get_messages`,
+`get_last_messages`, `wait_for_response`, `send_message(wait=True)`)
+now bypass the in-memory cache entirely.
+
+Cost impact: `wait_for_response` during the wait window now does ~1
+API call per state_change wake (= per polling cycle, 2 s during
+waiting mode). 10-min wait worst case = ~300 API calls. Comfortably
+under any free-tier limit.
+
+Tests: 104/104 plugin pass — existing tests don't exercise the cache
+short-circuit (turns out they covered the API path only, which is why
+the bug shipped).
+
 ## v0.7.1 — `get_last_messages` for context recovery (acked + unacked)
 
 New tool `get_last_messages(thread, limit=20)` — returns the last N
