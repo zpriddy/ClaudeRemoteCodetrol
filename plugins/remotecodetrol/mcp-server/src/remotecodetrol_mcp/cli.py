@@ -131,6 +131,21 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     )
     p_get.add_argument("--thread", help="Override active thread")
 
+    # v0.7.1: context recovery — fetch the last N messages including
+    # already-acked ones. Different from `get-messages` which only
+    # returns unacked entries.
+    p_get_last = sub.add_parser(
+        "get-last",
+        help="Fetch the last N user messages including acked ones (context recovery)",
+    )
+    p_get_last.add_argument("--thread", help="Override active thread")
+    p_get_last.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="How many messages back to fetch (default 20, server max 100)",
+    )
+
     sub.add_parser("link", help="Start the OAuth device-code flow + show QR")
     sub.add_parser(
         "check-link",
@@ -207,6 +222,12 @@ def _build_request(ns: argparse.Namespace) -> tuple[str, dict[str, Any]]:
         if ns.thread:
             args["thread"] = ns.thread
         return "get_messages", args
+    if ns.cmd == "get-last":
+        # v0.7.1: last-N including acked, for context recovery.
+        args = {"limit": int(ns.limit)}
+        if ns.thread:
+            args["thread"] = ns.thread
+        return "get_last_messages", args
     if ns.cmd == "link":
         return "link", {}
     if ns.cmd == "check-link":
@@ -324,6 +345,21 @@ def _format_human(cmd: str, result: dict[str, Any]) -> str:
             body = (m.get("body") or "").replace("\n", " ")
             mid = m.get("id", "?")
             lines.append(f"  [{tid}] {mid}  {body[:120]}")
+        return "\n".join(lines)
+    if cmd == "get_last_messages" and isinstance(payload, dict):
+        # Same PeekResult shape as peek_messages — reuse its formatter
+        # so the output is consistent across "look at history" surfaces.
+        msgs = payload.get("messages") or []
+        if not msgs:
+            return "(no messages in thread yet)"
+        lines = [f"last {len(msgs)} messages:"]
+        for m in msgs:
+            tid = m.get("thread_name") or m.get("thread_id") or "?"
+            body = (m.get("body") or "").replace("\n", " ")
+            mid = m.get("id", "?")
+            acked = m.get("acked_at") or m.get("ackedAt")
+            mark = "✓ " if acked else "• "
+            lines.append(f"  {mark}[{tid}] {mid}  {body[:120]}")
         return "\n".join(lines)
     if cmd == "whoami" and isinstance(payload, dict):
         lines = [

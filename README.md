@@ -2,179 +2,172 @@
 
 > Let Claude Code **send you push notifications on your iPhone** and **wait for your reply** — useful before destructive ops, after long-running tasks, or any time it's stuck on a decision and you're away from your terminal.
 
-This plugin bundles three things into one Claude Code install:
+This plugin bundles:
 
-- **9 MCP tools** Claude can call: `send_message`, `peek_messages`, `ack_messages`, `wait_for_response`, `set_thread`, `list_threads`, `whoami`, `link`, `logout`
-- **An operational skill** — `remotecodetrol` — that tells Claude *when* to use the tools (before destructive actions, after long tasks, etc.). Auto-loads with the plugin.
-- **A `/remotecodetrol:link` slash command** for the one-time OAuth device-code authorization
+- **MCP server** with 13 tools Claude can call: `send_message`, `peek_messages`, `ack_messages`, `get_messages`, `get_last_messages`, `wait_for_response`, `set_thread`, `list_threads`, `list_known_threads`, `forget_thread`, `whoami`, `link`, `complete_link`, `logout`
+- **Slash commands** under the `/rc:` prefix — `/rc:link`, `/rc:send_message`, `/rc:send_wait`, `/rc:wait_blocked`, `/rc:peek`, `/rc:ack`, `/rc:get_messages`, `/rc:get_last_messages`
+- **`rcct` CLI** — same operations from any shell, talks to the running MCP over a Unix domain socket. Faster than tool-call round-trips and useful in scripts.
+- **An operational skill** that auto-loads with the plugin and tells Claude *when* to use each tool
 
-The companion **iOS app** (RemoteCodetrol) renders Claude's messages with markdown + code blocks and lets you reply — replies surface to Claude on its next `peek_messages` call.
+The companion **iOS app** renders Claude's messages with markdown + code blocks, supports selectable response buttons, quick-reply from the notification, and has lock-screen + home-screen widgets that show pending replies.
 
 ---
 
-## How it works (one-paragraph mental model)
+## How it works (mental model)
 
-Claude calls `send_message("Tests pass — should I deploy?", require_response=True)`. The MCP hits the backend, which writes to Firestore, fans out to FCM, and lands a push on your phone within ~5 seconds. You read the push, open the iOS app, type "yes" or "rebase first," tap send. Claude is now polling — in `wait_for_response` it sees your reply on its next ~5-min poll, acks it, and continues with your input as the next user prompt. The push is the *interruption* signal; the polling loop is how Claude *receives* your answer.
+Claude calls `send_message("Tests pass — should I deploy?", require_response=True)`. The MCP hits the backend, which writes to Firestore, fans out to FCM, and lands a push on your phone within ~5 seconds. You read the push, reply directly from the notification or open the app. Claude's MCP runs a polling consumer that picks up your reply on its next cycle (~60 s idle, ~2 s while actively waiting) and surfaces it to Claude. The push is the *interruption* signal; polling is how Claude *receives* the answer.
 
 ---
 
 ## Prerequisites
 
-Before installing, make sure you have:
-
-1. **The RemoteCodetrol iOS app** installed on your iPhone (TestFlight invite from the project admin), signed in with an Apple ID that's been added to the allowlist. You should be able to sign in and reach the empty thread list view, *not* the "Account isn't approved yet" screen.
-2. **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)** ≥ recent version (any version that supports plugins).
-3. **[`uv`](https://docs.astral.sh/uv/)** on `PATH` — the plugin runs the MCP server via `uvx`, which uses uv's ephemeral env cache. Install:
+1. **The RemoteCodetrol iOS app** installed on your iPhone, signed in with an allowlisted Apple ID. You should reach the empty thread list — not the "Account isn't approved yet" screen.
+2. **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)** — any version that supports plugins.
+3. **[`uv`](https://docs.astral.sh/uv/)** on `PATH` — the plugin runs the MCP server via `uvx`. Install:
    ```bash
    curl -LsSf https://astral.sh/uv/install.sh | sh
    ```
-4. **macOS** — the MCP stores OAuth tokens in macOS Keychain via `keyring`. Linux/Windows are likely fine (`keyring` has cross-platform backends) but haven't been tested.
+4. **macOS** — primary target. Linux/Windows may work (`uv` and `keyring` are cross-platform) but aren't tested.
 
 ---
 
 ## Install
 
+Install via the public marketplace over HTTPS (no SSH or auth required — the repo is public):
+
 ```bash
-claude plugin marketplace add github:zpriddy/ClaudeRemoteCodetrol
-claude plugin install remotecodetrol@remotecodetrol
+claude plugin marketplace add https://github.com/zpriddy/ClaudeRemoteCodetrol.git
+claude plugin install rc@remotecodetrol
 ```
 
-That's it for install. Verify:
+The first argument is the HTTPS URL of this repo. Claude Code clones over HTTPS — no GitHub auth, no SSH key setup, no Personal Access Token needed for a public repo.
+
+Verify:
 
 ```bash
 claude plugin list
-# Should show:  remotecodetrol@remotecodetrol  Status: ✔ enabled
+# Should show:  rc@remotecodetrol  Status: ✔ enabled
 
 claude mcp list
-# Should show:  plugin:remotecodetrol:bridge  ✓ Connected
+# Should show:  plugin:rc:bridge  ✓ Connected
 ```
 
-If `mcp list` shows `✗ Failed`, jump to **Troubleshooting** below.
+The `rcct` CLI installs automatically via a `SessionStart` hook that symlinks `~/.local/bin/rcct` → the plugin's `bin/rcct`. If `~/.local/bin` isn't on your PATH, the hook prints a one-line stderr hint with the export command to add.
 
 ### Updating later
 
 ```bash
-claude plugin uninstall remotecodetrol@remotecodetrol
-claude plugin install remotecodetrol@remotecodetrol
+claude plugin uninstall rc@remotecodetrol
+claude plugin install rc@remotecodetrol
 ```
 
-(Reinstall is the cleanest update path. Some Claude Code versions also support `claude plugin update`.)
+Reinstall is the cleanest update path. If the running MCP process is serving stale code:
 
-If the running MCP process is serving stale code after a reinstall:
 ```bash
 pkill -f remotecodetrol-mcp
 ```
-The next tool call will respawn the MCP cleanly with the new code.
+
+The next tool call respawns the MCP cleanly.
 
 ---
 
 ## First-run authorization
 
-The plugin doesn't ship credentials — it uses an OAuth 2.0 device-code flow against the backend. Run the slash command:
+The plugin uses an OAuth 2.0 device-code flow against the backend. Run:
 
 ```
-/remotecodetrol:link
+/rc:link
 ```
 
-Claude calls the `link` tool. You'll see something like:
+Claude shows a QR code + a `user_code` like `WDJB-MJHT`. Either scan the QR with the iPhone's camera (deep-links straight into the app's authorize sheet) or:
 
-> **Open the RemoteCodetrol iOS app → Settings → "Authorize new device" → enter code `WDJB-MJHT` → tap Confirm.**
+1. Open the RemoteCodetrol iOS app → **Settings → Authorize new device**
+2. Enter the code, tap **Confirm**
 
-Do that. The `user_code` is valid for 10 minutes. Once you tap Confirm in the app, Claude can call any other tool (e.g., `whoami` to verify) — the next call detects the completed authorization and silently exchanges the device code for tokens. The refresh token is stored in macOS Keychain (`com.remotecodetrol.mcp` service), so subsequent Claude Code sessions are silent until you `logout` or revoke the device from the iOS app.
-
----
-
-## Daily use
-
-Once linked, the plugin "just works" — talk to Claude in natural language and it'll call the right tools based on the operational skill. Useful things to ask Claude:
-
-| Ask Claude | Tool used |
-|---|---|
-| "Set my remotecodetrol thread to `release-prep`" | `set_thread` |
-| "List my remotecodetrol threads" | `list_threads` |
-| "Send a status update to `release-prep`: tests pass — no need to wait" | `send_message(require_response=False)` |
-| "Send a question to `release-prep` and wait up to 5 minutes for my reply" | `send_message(require_response=True)` + `wait_for_response(timeout_minutes=5)` |
-| "Who am I logged in as on remotecodetrol?" | `whoami` |
-| "Log me out of remotecodetrol" | `logout` |
-| "Re-authorize remotecodetrol" | `/remotecodetrol:link` (slash command) |
-
-Or you can call tools directly through Claude's natural-language interface — the operational skill auto-loads at session start so Claude already knows the rules of when to push and when to poll.
-
----
-
-## Tool reference
-
-All tools live under the `mcp__plugin_remotecodetrol_bridge__` namespace. Claude calls them by name; you mostly don't.
-
-### `link()` *(slash command: `/remotecodetrol:link`)*
-Start the OAuth device-code flow. Returns `user_code` and `verification_uri` for you to enter in the iOS app. After you authorize, the next tool call completes the link silently. If already linked, returns `status: "already_linked"` with your email — no action needed.
-
-### `whoami()`
-Returns `{ email, default_thread }`. Forces a token validation pass. Useful for confirming the link is healthy and seeing what thread you're targeting.
-
-### `logout()`
-Clears all credentials: cached access token, keychain refresh token, and any pending device-code state. The next tool call requires a fresh `link()`.
-
-### `set_thread(name)`
-Sets the active thread for subsequent send/peek/ack calls in this and future sessions. Persisted to `~/.config/remotecodetrol/state.json`. Read fresh on every tool call so multiple Claude Code sessions stay in sync if one of them changes the thread.
-
-### `list_threads()`
-Returns all threads owned by the current user with their `lastMessageAt` timestamp. Threads are namespaced per user, so two different users can each have a thread named `alerts` without collision.
-
-### `send_message(body, require_response=False, thread=None, idempotency_key=None)`
-Sends a markdown-rendered message to the iOS app on the named thread (or the active thread if none given). The push arrives within ~5 seconds. Use `require_response=True` to signal that Claude is awaiting input — this surfaces in the iOS UI as an "Awaiting your response" badge.
-
-`idempotency_key` is optional but recommended in retry-prone code: send the same key twice and the backend returns 409 instead of duplicating.
-
-### `peek_messages(since_cursor=None, thread=None)`
-Returns user replies on the named thread that haven't been acked yet. **Crash-safe**: messages stay returnable until you `ack_messages` them, so a Claude crash mid-processing doesn't drop replies. The optional `since_cursor` advances past previously-seen replies for paginated reading.
-
-### `ack_messages(message_ids: list[str], thread=None)`
-Marks one or more user messages as processed. Idempotent — already-acked IDs are no-ops. After acking, those messages won't show up in subsequent `peek_messages` calls. The iOS app's checkmark on each message animates from gray (sent) to blue (acked) when this runs.
-
-### `wait_for_response(timeout_minutes=10, poll_interval_seconds=300, thread=None)`
-The convenience helper for the polling pattern: loops `peek_messages` → `ack_messages` → return as soon as a reply arrives, OR returns an empty list on timeout. Use this when Claude needs a synchronous "wait for the user's answer" semantic. On timeout it returns gracefully (empty `messages` list) rather than throwing — Claude can decide whether to push again, summarize state and stop, or proceed with a default.
-
----
-
-## Configuration
-
-All env vars are optional with sensible defaults. Set them in your shell rc (`~/.zshrc`, `~/.bashrc`):
-
-| Variable | Default | What it does |
-|---|---|---|
-| `REMOTECODETROL_THREAD` | *(none)* | Default thread for `send_message`/`peek`/`ack` when no per-call `thread=` is given. Lower priority than `set_thread` (which writes to disk). |
-| `REMOTECODETROL_DEVICE_LABEL` | `Claude Code on <hostname>` | Shown in iOS Settings → Devices so you can revoke this MCP install later. Useful if you authorize from multiple machines (e.g. `MacBook Pro (work)` vs `Mac mini (home)`). |
-| `REMOTECODETROL_DEFAULT_TIMEOUT_MINUTES` | `10` | Default `wait_for_response` timeout. Override per call with `wait_for_response(timeout_minutes=...)`. |
-| `REMOTECODETROL_DEFAULT_POLL_INTERVAL_SECONDS` | `300` (5 min) | Default poll cadence inside `wait_for_response`. Lower for snappier UX (more API hits); higher for cheaper at-rest cost. |
-| `REMOTECODETROL_API_BASE` | `https://us-central1-remotecodetrol.cloudfunctions.net/api` | Override only if you're running a fork of the backend (e.g. self-hosted). |
-| `REMOTECODETROL_KEYCHAIN_SERVICE` | `com.remotecodetrol.mcp` | Keychain service name used for refresh-token storage. Override if you want to keep credentials for multiple backends side-by-side. |
-
-Example `.zshrc` snippet:
-
-```bash
-export REMOTECODETROL_THREAD=primary
-export REMOTECODETROL_DEVICE_LABEL="MacBook Pro (work)"
-export REMOTECODETROL_DEFAULT_TIMEOUT_MINUTES=15
-```
-
-### Thread resolution priority
-
-Multiple sources can specify which thread a tool call targets. Resolution order:
-
-1. **Per-call `thread="..."` parameter** — wins if Claude passes it explicitly
-2. **`set_thread(name)` call earlier in this or a prior session** — persisted to `~/.config/remotecodetrol/state.json`, read on every call
-3. **`REMOTECODETROL_THREAD` env var** — fallback default
-
-If none are set, `send_message`/`peek`/`ack` error with a friendly "no thread set" message. Run `list_threads()` then `set_thread(...)` to fix.
+Claude completes the authorization on the next tool call. The token (single 14-day opaque token, rotated mid-life) is stored at `~/Library/Application Support/RemoteCodetrol/tokens.json` (chmod 0600).
 
 ---
 
 ## Slash commands
 
-### `/remotecodetrol:link`
+All under the `/rc:` prefix:
 
-The OAuth device-code flow entry point. Equivalent to asking Claude to call the `link` tool, but the slash command bundles the right "show the user_code, wait for them to authorize, then verify with whoami" prompt.
+| Command | What it does |
+|---|---|
+| `/rc:link` | OAuth device-code flow — one-time per Claude Code install |
+| `/rc:send_message` | Send a message to your phone (fire-and-forget) |
+| `/rc:send_wait` | Send + block until you reply (timeout-bounded) |
+| `/rc:wait_blocked` | Block waiting for a reply (no send; default 10-min timeout) |
+| `/rc:peek` | Look at pending replies WITHOUT acking |
+| `/rc:ack` | Manually ack specific message ids |
+| `/rc:get_messages` | Fetch all pending replies AND ack them (combined peek + ack) |
+| `/rc:get_last_messages` | Fetch the last N user messages including already-acked ones (context recovery) |
+
+**When to use which:**
+- Sending: `/rc:send_message` (default) or `/rc:send_wait` (when you can't continue without the answer).
+- Reading new replies: `/rc:get_messages` (the 90% case — consume + ack) or `/rc:peek` (read-only check).
+- Recovering history: `/rc:get_last_messages` (works on already-acked messages too).
+- Waiting: `/rc:wait_blocked` (already sent, need to block) or `/rc:send_wait` (send + block in one call).
+
+---
+
+## CLI (`rcct`)
+
+Auto-installs alongside the MCP via a `SessionStart` hook. Available from any shell once the plugin is loaded once:
+
+```bash
+rcct send-message "tests pass — deploy?"        # fire-and-forget
+rcct send-wait "deploy now? y/n" --timeout 5    # send + block 5 min
+rcct peek                                       # what's pending? (no ack)
+rcct get-messages                               # fetch + ack pending
+rcct get-last --limit 20                        # last 20 incl acked
+rcct ack <message-id>                           # manual ack
+rcct wait-blocked --timeout 10                  # block waiting
+
+rcct whoami                                     # who am I logged in as?
+rcct link                                       # OAuth device-code flow
+rcct logout                                     # clear credentials
+rcct threads list                               # show all threads
+rcct threads allow <name>                       # add to known set
+rcct threads forget <name>                      # remove from known set
+```
+
+Existing-from-v0.6 aliases still work: `rcct send` = `rcct send-message`, `rcct check` = `rcct peek`, `rcct wait` = `rcct wait-blocked`.
+
+The CLI talks to the running MCP over a Unix socket (`~/Library/Caches/remotecodetrol/mcp.sock`). Same Python codebase, single implementation, two surfaces. Whatever the MCP tools do, the CLI does.
+
+---
+
+## Configuration
+
+All env vars are optional. Set in `~/.zshrc` / `~/.bashrc`:
+
+| Variable | Default | What it does |
+|---|---|---|
+| `REMOTECODETROL_THREAD` | none | Default thread when no per-call override |
+| `REMOTECODETROL_DEVICE_LABEL` | `Claude Code on <hostname>` | Shown in iOS Settings → Devices |
+| `REMOTECODETROL_DEFAULT_TIMEOUT_MINUTES` | `10` | Default `wait_for_response` timeout |
+| `REMOTECODETROL_API_BASE` | `https://us-central1-remotecodetrol.cloudfunctions.net/api` | Override for a forked backend |
+| `RC_DISABLE_POLLING` | unset | Set to `1` to disable the background polling consumer. Tools fall through to direct per-call API requests. |
+| `RC_DISABLE_LEADER` | unset | Set to `1` to disable per-host leader election (every Claude session polls independently). Default is leader-elected so only one MCP per host actually polls. |
+| `RC_DISABLE_CLI_SOCKET` | unset | Set to `1` to disable the `rcct` CLI socket. Useful for tests; you lose CLI access. |
+
+### Thread resolution priority
+
+1. Per-call `thread="..."` parameter
+2. `set_thread(name)` value (persisted to `~/.config/remotecodetrol/state.json`)
+3. `REMOTECODETROL_THREAD` env var
+
+If none are set, send/peek/ack error with a friendly "no thread set" message. Run `rcct threads list` then `rcct threads allow <name>` (which also sets active).
+
+---
+
+## Architecture notes (current state)
+
+- **Polling, not streaming.** v0.6.0 replaced the SSE Cloud Function with a polling consumer. The Cloud Run cost of streaming at containerConcurrency=1 made it untenable; polling at ~60 s cadence (5 s busy, 2 s while actively waiting via `wait=True`, dropping to dormant 5-min cadence after 2 h idle) fits comfortably inside the Firestore + Cloud Functions free tier.
+- **Leader-elected polling.** Each Claude Code session spawns its own MCP, but exactly one MCP per host actually runs the poll loop (POSIX `flock` on `~/Library/Caches/remotecodetrol/poll.lock`). Followers serve `peek_messages` via the leader's `pending.json` on disk — no per-session polling overhead.
+- **No `peek_messages` cache.** v0.6.2 removed it after long threads exposed truncation issues (polling consumer fetches up to `peekMaxLimit`=100 per cycle; threads with > 100 unacked replies hid some). Every peek goes direct to the API.
+- **Plugin name is `rc`.** v0.7.0 renamed from `remotecodetrol` for shorter slash commands. The install slug, marketplace name, and MCP tool prefix all derive from this.
 
 ---
 
@@ -182,22 +175,17 @@ The OAuth device-code flow entry point. Equivalent to asking Claude to call the 
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `command not found: uvx` | uv not installed or not on PATH | `curl -LsSf https://astral.sh/uv/install.sh \| sh`, restart shell |
-| `claude plugin marketplace add github:...` fails | Network / GitHub rate limit / wrong slug | Re-run; verify the org/repo exists; or `gh repo clone zpriddy/ClaudeRemoteCodetrol && claude plugin marketplace add ./ClaudeRemoteCodetrol` (local install fallback) |
-| Tool returns "**Not authorized. Run /remotecodetrol:link**" | No keychain token | Run `/remotecodetrol:link`, authorize on phone |
-| Tool returns "**Authorization is still pending...**" | You called a tool before tapping Confirm in the iOS app | Tap Confirm, then retry the call. The next call detects the completion. |
-| Push doesn't arrive on phone | iOS app not opened recently (FCM token may have expired), or notifications muted, or APNs misconfigured | Open the iOS app once to refresh the FCM token. Check iOS Settings → Notifications → RemoteCodetrol → Allow. |
-| Tool calls return stale data after a code change | An older MCP process is still in memory | `pkill -f remotecodetrol-mcp`; next call respawns from the latest installed version |
-| Plugin reload doesn't pick up code changes | Plugins are cached by version | `claude plugin uninstall ... && claude plugin install ...` |
-| Account isn't approved yet (in iOS app) | Email isn't on the allowlist OR the `allowlisted` custom claim isn't yet set | Tell the project admin your email or your Apple "Hide My Email" relay address — they'll add it and you'll need to sign out + sign in to refresh the token |
+| `command not found: uvx` | `uv` not installed or not on PATH | `curl -LsSf https://astral.sh/uv/install.sh \| sh`, restart shell |
+| Plugin install fails on `claude plugin marketplace add` | Network / wrong URL | Verify the HTTPS URL: `https://github.com/zpriddy/ClaudeRemoteCodetrol.git`. The repo is public so no auth is needed. |
+| Tool returns "Not authorized. Run /rc:link" | No stored token | Run `/rc:link`, authorize on phone |
+| Push doesn't arrive on phone | iOS app's FCM token expired, or notifications muted | Open the iOS app once to refresh the FCM token; check iOS Settings → Notifications → RemoteCodetrol |
+| `rcct` command not found in shell | `~/.local/bin` isn't on PATH | Add `export PATH="$HOME/.local/bin:$PATH"` to `~/.zshrc` |
+| Tool calls return stale data after a code change | Older MCP process still in memory | `pkill -f remotecodetrol-mcp`; next call respawns |
+| MCP not connected after install | Plugin update needs a fresh marketplace re-add | `claude plugin marketplace remove remotecodetrol && claude plugin marketplace add https://github.com/zpriddy/ClaudeRemoteCodetrol.git && claude plugin install rc@remotecodetrol` |
 
-For deeper debugging, you can run the MCP server standalone to see its stderr:
+For deeper debugging, set `REMOTECODETROL_LOG_LEVEL=DEBUG` and run the MCP directly:
 
 ```bash
-# Find the cached install path:
-ls ~/.claude/plugins/cache/remotecodetrol/remotecodetrol/*/mcp-server
-
-# Run it directly (Ctrl+C to stop):
 uvx --from ~/.claude/plugins/cache/remotecodetrol/remotecodetrol/<version>/mcp-server remotecodetrol-mcp
 ```
 
@@ -206,16 +194,14 @@ uvx --from ~/.claude/plugins/cache/remotecodetrol/remotecodetrol/<version>/mcp-s
 ## Uninstall
 
 ```bash
-claude plugin uninstall remotecodetrol@remotecodetrol
+claude plugin uninstall rc@remotecodetrol
 claude plugin marketplace remove remotecodetrol
 
-# Optional: wipe the stored OAuth refresh token from Keychain
-keyring delete com.remotecodetrol.mcp <your-email>
-```
+# Optional: wipe stored OAuth tokens
+rm -f ~/Library/Application\ Support/RemoteCodetrol/tokens.json
 
-To forget the active thread:
-```bash
-rm ~/.config/remotecodetrol/state.json
+# Optional: forget the active thread
+rm -f ~/.config/remotecodetrol/state.json
 ```
 
 ---
@@ -223,16 +209,16 @@ rm ~/.config/remotecodetrol/state.json
 ## Privacy & data
 
 - The plugin sends only what Claude explicitly passes via tool calls (message bodies, idempotency keys, thread names) plus the OAuth bearer token.
-- Refresh tokens live in macOS Keychain. They never travel to disk in plaintext.
-- The active-thread state file at `~/.config/remotecodetrol/state.json` contains the thread name only — no credentials.
-- The backend is locked to allowlisted users (closed-group beta).
+- OAuth tokens live at `~/Library/Application Support/RemoteCodetrol/tokens.json` (chmod 0600) — never on disk in plaintext outside that file.
+- The active-thread state file at `~/.config/remotecodetrol/state.json` contains the thread name only.
+- The backend is locked to an email allowlist (closed-group beta).
 - All transport is HTTPS / TLS 1.2+.
 
 ---
 
 ## Source
 
-The canonical repo is this one — `github.com/zpriddy/ClaudeRemoteCodetrol`. The Python MCP source lives under `plugins/remotecodetrol/mcp-server/`. PRs welcome.
+The canonical repo is this one — `https://github.com/zpriddy/ClaudeRemoteCodetrol`. The Python MCP source lives under `plugins/remotecodetrol/mcp-server/`. PRs welcome.
 
 ---
 

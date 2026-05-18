@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.7.1 — `get_last_messages` for context recovery (acked + unacked)
+
+New tool `get_last_messages(thread, limit=20)` — returns the last N
+user messages on a thread, INCLUDING already-acked ones, in
+chronological order. Read-only; never acks. Use for "what was the
+user asking about?" context recovery after a session restart or
+when you've lost the thread's recent history.
+
+**Backend change:** `GET /v1/threads/{tid}/messages` accepts a new
+`recent=true` query param. When set, the route orders by createdAt
+desc, applies limit, then reverses the result before responding —
+so the wire-shape contract (chronological order) is unchanged but
+you get the last N instead of the first N. Mutually exclusive
+with `since` (the cursor pattern doesn't apply to the desc window).
+
+**Plugin additions:**
+- `mcp__plugin_rc_bridge__get_last_messages` MCP tool
+- `rcct get-last [--limit N] [--thread X]` CLI subcommand
+- `/rc:get_last_messages` slash command
+
+When to use which:
+- `/rc:get_last_messages` — read recent history including acked
+  messages (the new tool — for context recovery)
+- `/rc:peek` — read-only check of unacked only (no ack)
+- `/rc:get_messages` — peek + ack of unacked (the "consume" pattern)
+
+Tests: 104/104 plugin (3 new for get_last_messages),
+       53/53 backend (2 new for recent query semantics).
+
 ## v0.7.0 — `/rc:` slash commands; new `get_messages` tool; CLI parity
 
 Two changes you'll notice immediately:

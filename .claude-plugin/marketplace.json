@@ -6,9 +6,9 @@
   },
   "plugins": [
     {
-      "name": "remotecodetrol",
+      "name": "rc",
       "source": "./plugins/remotecodetrol",
-      "description": "Bundled MCP server + skill for sending iOS push notifications and polling for replies via the RemoteCodetrol app."
+      "description": "RemoteCodetrol — bundled MCP server + skill for sending iOS push notifications and polling for replies via the RemoteCodetrol app. Slash-command prefix /rc: for fast typing."
     }
   ]
 }

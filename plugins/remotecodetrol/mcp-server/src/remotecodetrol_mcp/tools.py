@@ -705,6 +705,49 @@ def register_tools(
         return GetMessagesResult(messages=msgs, acked=len(message_ids))
 
     @mcp.tool
+    async def get_last_messages(
+        thread: str | None = None,
+        limit: int = 20,
+    ) -> PeekResult:
+        """**Context recovery** — fetch the last N user messages on a
+        thread, INCLUDING already-acked ones.
+
+        Different from `peek_messages` / `get_messages`, which return
+        only *unacked* replies. This tool is for the "what was that
+        question I answered earlier?" or "what was the user discussing
+        before I lost context?" pattern. It does NOT ack anything; the
+        messages stay in whatever state they were already in.
+
+        `limit` defaults to 20 and is server-capped at `peekMaxLimit`
+        (100). Returns chronological order (oldest → newest of the
+        last-N window) so the caller can read top-to-bottom.
+
+        Use cases:
+          - Recovering context after a session restart
+          - Pulling thread history for a "what's the gist?" summary
+          - Audit / debugging
+        """
+        tid = _resolve_thread(state, thread)
+        _ensure_known_thread(streaming, tid, auto_add=False)
+        # No `arm_polling()` — this is a one-off context fetch, not a
+        # "watching for new messages" signal. Keeps the consumer in its
+        # current state.
+
+        # Clamp the limit before hitting the wire so an obvious caller
+        # mistake doesn't burn the server's tighter cap silently.
+        safe_limit = max(1, min(int(limit), 100))
+        params = {
+            "unackedOnly": "false",
+            "recent": "true",
+            "limit": str(safe_limit),
+            "format": "wire",
+        }
+        data = await api.get(f"/threads/{tid}/messages", params=params)
+        msgs = [Message.model_validate(m) for m in _messages_from_api(data)]
+        cursor = data.get("cursor") if isinstance(data, dict) else None
+        return PeekResult(messages=msgs, cursor=cursor, source="api")
+
+    @mcp.tool
     async def list_threads() -> list[ThreadSummary]:
         """List ALL the user's threads with last-activity timestamps.
 
@@ -934,6 +977,7 @@ def register_tools(
     _expose("peek_messages", peek_messages)
     _expose("ack_messages", ack_messages)
     _expose("get_messages", get_messages)
+    _expose("get_last_messages", get_last_messages)
     _expose("list_threads", list_threads)
     _expose("forget_thread", forget_thread)
     _expose("list_known_threads", list_known_threads)

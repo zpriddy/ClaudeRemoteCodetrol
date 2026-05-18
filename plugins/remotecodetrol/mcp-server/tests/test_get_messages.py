@@ -159,6 +159,96 @@ async def test_get_messages_rejects_unknown_thread(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_get_last_messages_uses_recent_query(tmp_path):
+    """v0.7.1: get_last_messages MUST request `recent=true` so the
+    backend orders desc + limit + reverses. Without this flag the
+    backend returns oldest-first, missing recent messages on long
+    threads. Also MUST pass `unackedOnly=false` so acked context
+    messages are included — that's the whole point of this tool."""
+    captured_params: list[dict[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and "/threads/work/messages" in request.url.path:
+            captured_params.append(dict(request.url.params))
+            return httpx.Response(
+                200,
+                json={
+                    "messages": [
+                        {"id": "older", "thread_id": "work", "body": "first"},
+                        {"id": "newer", "thread_id": "work", "body": "second"},
+                    ],
+                    "cursor": None,
+                },
+            )
+        return httpx.Response(404)
+
+    dispatchers, http, _ = await _build_dispatchers(handler, tmp_path)
+    try:
+        result = await dispatchers["get_last_messages"]({"thread": "work", "limit": 5})
+        assert [m.id for m in result.messages] == ["older", "newer"]
+        assert len(captured_params) == 1
+        params = captured_params[0]
+        assert params.get("recent") == "true"
+        assert params.get("unackedOnly") == "false"
+        assert params.get("limit") == "5"
+        assert params.get("format") == "wire"
+    finally:
+        await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_get_last_messages_clamps_limit(tmp_path):
+    """The MCP tool clamps `limit` to [1, 100] before hitting the wire,
+    so an obvious caller mistake (e.g. limit=10_000) doesn't burn the
+    server's tighter cap silently. We pin both ends here."""
+    captured_limits: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_limits.append(request.url.params.get("limit", ""))
+        return httpx.Response(200, json={"messages": [], "cursor": None})
+
+    dispatchers, http, _ = await _build_dispatchers(handler, tmp_path)
+    try:
+        await dispatchers["get_last_messages"]({"thread": "work", "limit": 999})
+        await dispatchers["get_last_messages"]({"thread": "work", "limit": 0})
+        assert captured_limits == ["100", "1"]
+    finally:
+        await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_get_last_messages_does_not_ack(tmp_path):
+    """The whole point of get_last_messages is READ-ONLY context
+    recovery. Must never POST /ack as a side effect."""
+    posted_acks: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and "/threads/work/messages" in request.url.path:
+            return httpx.Response(
+                200,
+                json={
+                    "messages": [
+                        {"id": "m1", "thread_id": "work", "body": "hi"},
+                    ],
+                    "cursor": None,
+                },
+            )
+        if request.method == "POST" and request.url.path.endswith("/ack"):
+            posted_acks.append(request.url.path)
+            return httpx.Response(200, json={"acked": 1})
+        return httpx.Response(404)
+
+    dispatchers, http, _ = await _build_dispatchers(handler, tmp_path)
+    try:
+        await dispatchers["get_last_messages"]({"thread": "work"})
+        assert posted_acks == [], (
+            f"get_last_messages must NOT call /ack; saw: {posted_acks}"
+        )
+    finally:
+        await http.aclose()
+
+
+@pytest.mark.asyncio
 async def test_get_messages_prunes_cache_after_ack(tmp_path):
     """After a successful ack, the in-memory streaming cache must drop
     the acked messages so peek/hook don't re-surface them."""
