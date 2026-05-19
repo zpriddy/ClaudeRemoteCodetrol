@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.7.3 — restore response-options guidance in slash commands
+
+`/rc:send_message` and `/rc:send_wait` were silently producing
+plain-text messages even when a multiple-choice question would have
+been a tappable-button case. Confirmed by inspecting recent Firestore
+docs: every `[claude] senderType` message back to v0.7.0 had
+`responseOptions: undefined` — never present.
+
+**Root cause:** when commit `f2dad3fc` renamed the plugin to `rc` and
+rewrote every slash command markdown file, the `response_options` /
+`selection_mode` instructions for `mcp__plugin_rc_bridge__send_message`
+got dropped. The MCP tool itself still accepts the parameters
+correctly; the slash command instructions just no longer mention them,
+so Claude has no idea to pass them.
+
+This is a textbook reminder that **slash command markdown is part of
+the plugin's API contract**, not just user-facing docs. Claude reads
+them as the spec for which tool parameters to use. A complete tool
+implementation with an incomplete slash command produces precisely
+this failure: the tool *could* be invoked correctly, but Claude
+doesn't know to.
+
+**Fix in v0.7.3:**
+
+- `commands/send_message.md`: new "decide if response options would
+  help" step before the tool call, with a shape example, rules for
+  `id` / `label` formatting, and explicit guidance on when to use
+  buttons vs. when free-text replies are the right call.
+- `commands/send_wait.md`: same, plus a stronger default-toward-options
+  recommendation (`send_wait` is the case where buttons help most — you're
+  already blocking on a reply, a tap is faster than typing). Adds a step
+  for interpreting `selectedOptionIds` in the reply.
+- Both files now explicitly note: the user can type a free-text reply
+  even with options visible. Don't assume reply ∈ options.
+- No Python code changes; this is purely slash command markdown.
+
 ## v0.7.2 — purge cache reads from peek / wait / send_message(wait=True)
 
 Reported: `peek_messages` and `get_messages` returning nothing even
